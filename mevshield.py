@@ -1489,7 +1489,6 @@ def main():
             "key_epoch": key_epoch,
             "commitment": commitment_hex,
             "ciphertext": "0x" + blob.hex(),
-            "max_weight": {"ref_time": 5_000_000_000, "proof_size": 128_000},
         },
     )
     rec = submit_signed(substrate, author, call_submit)
