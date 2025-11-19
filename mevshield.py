@@ -1453,7 +1453,7 @@ def main():
     # Domain-separated signature: "mev-shield:v1" || genesis || payload_core
     genesis = get_genesis_hash_bytes(substrate)
     sig64 = cold.sign(b"mev-shield:v1" + genesis + payload_core)
-    multisig = b"\x01" + sig64  # MultiSignature::Sr25519
+    multisig = b"\x01" + sig64
     plaintext = payload_core + multisig
 
     # Read the *announced next* ML‑KEM public key + its epoch.
@@ -1467,7 +1467,7 @@ def main():
     # AEAD key = shared_secret (must match node-side derive_aead_key).
     blob = mlkem768_seal_blob(pk_bytes, plaintext)
 
-    # Commitment over (signer, nonce, mortality, call)
+    # Commitment over (signer, nonce, call)
     commitment_hex = "0x" + blake2_256(payload_core).hex()
 
     # We use the epoch attached to NextKey itself as key_epoch.
@@ -1486,7 +1486,6 @@ def main():
         mev_pallet,
         "submit_encrypted",
         {
-            "key_epoch": key_epoch,
             "commitment": commitment_hex,
             "ciphertext": "0x" + blob.hex(),
         },
