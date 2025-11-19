@@ -1448,7 +1448,7 @@ def main():
     signer_raw32 = bytes(signer_raw32)
 
     nonce_u32 = account_nonce(substrate, cold.ss58_address) & 0xFFFFFFFF
-    payload_core = signer_raw32 + struct.pack("<I", nonce_u32) + b"\x00" + call_bytes
+    payload_core = signer_raw32 + struct.pack("<I", nonce_u32) + call_bytes
 
     # Domain-separated signature: "mev-shield:v1" || genesis || payload_core
     genesis = get_genesis_hash_bytes(substrate)
@@ -1489,7 +1489,6 @@ def main():
             "key_epoch": key_epoch,
             "commitment": commitment_hex,
             "ciphertext": "0x" + blob.hex(),
-            "payload_version": 1,
             "max_weight": {"ref_time": 5_000_000_000, "proof_size": 128_000},
         },
     )
