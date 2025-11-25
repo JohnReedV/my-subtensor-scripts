@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 MEV‑Shield add_stake E2E:
-  • Reads MevShield::NextKey { public_key: Vec<u8>(1184), epoch: u64 }
+  • Reads MevShield::NextKey as Vec<u8>(1184) ML‑KEM public key
   • Builds plaintext (signer, nonce<u32>, Era::Immortal, call, MultiSignature)
   • Calls Rust FFI to produce blob:
       [u16 kem_len=1088 LE][kem_ct 1088B][nonce24][aead_ct]
@@ -268,28 +268,19 @@ def _normalize_hex_0x(v: Any) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def read_next_key_bytes_and_epoch(
+def read_next_key_bytes(
     substrate: SubstrateInterface,
     pallet: str,
-) -> Tuple[bytes, int]:
+) -> bytes:
     """
-    Read MevShield::NextKey { public_key: Vec<u8>, epoch: u64 }.
+    Read MevShield::NextKey as a plain Vec<u8> ML‑KEM‑768 public key.
     """
     v = substrate.query(pallet, "NextKey", [])
-    kv = getattr(v, "value", None)
-    if not isinstance(kv, dict):
-        raise RuntimeError("NextKey not set yet (None)")
-
-    pk_field = kv.get("public_key")
-    if pk_field is None:
-        raise RuntimeError("NextKey.public_key missing")
-
-    pk_bytes = _parse_vec_u8(pk_field)
+    raw = getattr(v, "value", v)
+    pk_bytes = _parse_vec_u8(raw)
     if not pk_bytes:
-        raise RuntimeError("NextKey.public_key parse error")
-
-    epoch = int(kv.get("epoch", 0))
-    return pk_bytes, epoch
+        raise RuntimeError("NextKey not set or malformed (expected Vec<u8> ML‑KEM pk)")
+    return pk_bytes
 
 
 def acquire_next_key(
@@ -297,23 +288,21 @@ def acquire_next_key(
     pallet: str,
     timeout_s: int = 120,
     poll_s: float = 0.25,
-) -> Tuple[bytes, int]:
+) -> bytes:
     """
     Poll MevShield::NextKey until we have a well-formed ML‑KEM‑768 key.
 
-    Returns (public_key_bytes, epoch) where:
-        len(public_key_bytes) == MLKEM768_PK_LEN
-        epoch is the key_epoch we will pass to submit_encrypted.
+    Returns `public_key_bytes` where len(public_key_bytes) == MLKEM768_PK_LEN.
     """
     t0 = time.time()
     last_err: Optional[str] = None
 
     while time.time() - t0 < timeout_s:
         try:
-            pk, epoch = read_next_key_bytes_and_epoch(substrate, pallet)
+            pk = read_next_key_bytes(substrate, pallet)
             if len(pk) == MLKEM768_PK_LEN:
-                return pk, epoch
-            last_err = f"unexpected NextKey.public_key length {len(pk)}"
+                return pk
+            last_err = f"unexpected NextKey length {len(pk)}"
         except Exception as e:
             last_err = str(e)
         time.sleep(poll_s)
@@ -670,14 +659,6 @@ def compose_add_stake(
         "Unable to compose add_stake (tried amount_staked/amount/value). "
         f"Last error: {last_err}"
     )
-
-
-def get_epoch(substrate: SubstrateInterface, pallet: str) -> int:
-    try:
-        v = substrate.query(pallet, "Epoch", [])
-        return int(v.value)
-    except Exception:
-        return 0
 
 
 def ensure_subnet_exists_or_register(
@@ -1366,7 +1347,7 @@ def assert_reveal_hidden(
 def main():
     ap = argparse.ArgumentParser(
         description=(
-            "MEV‑Shield add_stake using MevShield::NextKey (public_key, epoch) and "
+            "MEV‑Shield add_stake using MevShield::NextKey (Vec<u8> ML‑KEM public key) and "
             "asserting that the inner add_stake stays MEV‑hidden until reveal, "
             "including pool-level (tx pool) visibility."
         )
@@ -1456,11 +1437,11 @@ def main():
     multisig = b"\x01" + sig64
     plaintext = payload_core + multisig
 
-    # Read the *announced next* ML‑KEM public key + its epoch.
-    pk_bytes, epoch_next = acquire_next_key(substrate, mev_pallet)
+    # Read the *announced next* ML‑KEM public key (no epoch in storage anymore).
+    pk_bytes = acquire_next_key(substrate, mev_pallet)
     if len(pk_bytes) != MLKEM768_PK_LEN:
         raise RuntimeError(
-            f"NextKey.public_key length {len(pk_bytes)} != {MLKEM768_PK_LEN}"
+            f"NextKey length {len(pk_bytes)} != {MLKEM768_PK_LEN}"
         )
 
     # Encrypt with Rust FFI (Kyber/ML‑KEM‑768 + XChaCha20-Poly1305),
@@ -1470,15 +1451,7 @@ def main():
     # Commitment over (signer, nonce, call)
     commitment_hex = "0x" + blake2_256(payload_core).hex()
 
-    # We use the epoch attached to NextKey itself as key_epoch.
-    curr_epoch = get_epoch(substrate, mev_pallet)
-    if epoch_next < curr_epoch:
-        # Very stale NextKey: re-read once; if still stale, let chain reject with BadEpoch.
-        pk_bytes, epoch_next = acquire_next_key(substrate, mev_pallet)
-        blob = mlkem768_seal_blob(pk_bytes, plaintext)
-
-    key_epoch = int(epoch_next)
-    print(f"[i] Using MevShield::NextKey epoch={key_epoch} (chain Epoch={curr_epoch})")
+    print("[i] Using MevShield::NextKey (single Vec<u8> ML‑KEM public key; no on-chain epoch)")
 
     # Submit encrypted wrapper
     call_submit = compose_call(
@@ -1491,7 +1464,7 @@ def main():
         },
     )
     rec = submit_signed(substrate, author, call_submit)
-    print(f"[✓] submit_encrypted accepted; block={rec.block_hash}, key_epoch={key_epoch}")
+    print(f"[✓] submit_encrypted accepted; block={rec.block_hash}")
 
     # MEV‑safety assertion: encrypted-only representation until later execute_revealed,
     # and no pool-level execute_revealed for this stake.
