@@ -3,7 +3,7 @@
 """
 MEV‑Shield add_stake E2E:
   • Reads MevShield::NextKey as Vec<u8>(1184) ML‑KEM public key
-  • Builds plaintext (signer, nonce<u32>, Era::Immortal, call, MultiSignature)
+  • Builds plaintext (signer, key_hash=blake2_256(NextKey), call, MultiSignature)
   • Calls Rust FFI to produce blob:
       [u16 kem_len=1088 LE][kem_ct 1088B][nonce24][aead_ct]
   • Submits mev_shield::submit_encrypted
@@ -11,7 +11,7 @@ MEV‑Shield add_stake E2E:
 
       Let the inner call be:
         SubtensorModule::add_stake(hotkey=H, netuid=N, amount=A) with
-        signer C (cold account) and nonce u32.
+        signer C (cold account).
 
       1. Inclusion block B_submit:
            - contains MevShield::submit_encrypted with our commitment,
@@ -24,7 +24,7 @@ MEV‑Shield add_stake E2E:
 
       3. A later block B_reveal:
            - contains MevShield::execute_revealed whose inner call is
-             exactly our add_stake(H, N, A) with signer C and nonce,
+             exactly our add_stake(H, N, A) with signer C,
            - still has NO plain Subtensor::add_stake(H, N, A').
 
       4. POOL‑LEVEL ASSERTION:
@@ -39,6 +39,8 @@ Crypto details:
   • ML‑KEM‑768 (Kyber) for KEM
   • XChaCha20‑Poly1305 for AEAD
   • AEAD key = ML‑KEM shared secret (direct, 32 bytes; no HKDF)
+  • Signed payload uses key_hash = blake2_256(NextKey_bytes) instead
+    of an account nonce; replay protection is per‑key epoch.
 
 Dependencies:
   python3 -m pip install --user substrate-interface
@@ -264,23 +266,38 @@ def _normalize_hex_0x(v: Any) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MevShield::NextKey access (encrypt to the upcoming key)
+# MevShield key access (NextKey / CurrentKey)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 def read_next_key_bytes(
     substrate: SubstrateInterface,
     pallet: str,
+    block_hash: Optional[str] = None,
 ) -> bytes:
     """
     Read MevShield::NextKey as a plain Vec<u8> ML‑KEM‑768 public key.
+    If block_hash is provided, read it at that block.
     """
-    v = substrate.query(pallet, "NextKey", [])
+    v = substrate.query(pallet, "NextKey", [], block_hash=block_hash)
     raw = getattr(v, "value", v)
     pk_bytes = _parse_vec_u8(raw)
-    if not pk_bytes:
-        raise RuntimeError("NextKey not set or malformed (expected Vec<u8> ML‑KEM pk)")
-    return pk_bytes
+    return pk_bytes or b""
+
+
+def read_current_key_bytes(
+    substrate: SubstrateInterface,
+    pallet: str,
+    block_hash: Optional[str] = None,
+) -> bytes:
+    """
+    Read MevShield::CurrentKey as a plain Vec<u8> ML‑KEM‑768 public key.
+    If block_hash is provided, read it at that block.
+    """
+    v = substrate.query(pallet, "CurrentKey", [], block_hash=block_hash)
+    raw = getattr(v, "value", v)
+    pk_bytes = _parse_vec_u8(raw)
+    return pk_bytes or b""
 
 
 def acquire_next_key(
@@ -300,7 +317,7 @@ def acquire_next_key(
     while time.time() - t0 < timeout_s:
         try:
             pk = read_next_key_bytes(substrate, pallet)
-            if len(pk) == MLKEM768_PK_LEN:
+            if pk and len(pk) == MLKEM768_PK_LEN:
                 return pk
             last_err = f"unexpected NextKey length {len(pk)}"
         except Exception as e:
@@ -310,9 +327,9 @@ def acquire_next_key(
     raise RuntimeError(f"Timed out reading MevShield::NextKey ({last_err})")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────-
 # Substrate helpers & utilities
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────-
 
 
 def blake2_256(b: bytes) -> bytes:
@@ -398,16 +415,6 @@ def submit_signed(substrate, who: Keypair, call):
 def get_genesis_hash_bytes(substrate: SubstrateInterface) -> bytes:
     hx = substrate.get_block_hash(0)
     return bytes.fromhex(hx[2:]) if isinstance(hx, str) and hx.startswith("0x") else bytes(32)
-
-
-def account_nonce(substrate: SubstrateInterface, ss58: str) -> int:
-    try:
-        return int(substrate.get_account_nonce(ss58))
-    except Exception:
-        info = substrate.query("System", "Account", [ss58]).value
-        if isinstance(info, dict) and "nonce" in info:
-            return int(info["nonce"])
-        return 0
 
 
 def call_to_scale_bytes(call) -> bytes:
@@ -921,11 +928,14 @@ def _is_our_execute_revealed(
     hot_ss58: str,
     netuid: int,
     amount_planck: int,
-    nonce_u32: int,
+    expected_key_hash_hex: str,
 ) -> bool:
     """
     Check whether MevShield::execute_revealed's call_args correspond
-    to *our* encrypted add_stake plaintext.
+    to *our* encrypted add_stake plaintext, identified by:
+      * signer (cold_ss58)
+      * key_hash (blake2_256(NextKey_bytes) at submit time)
+      * inner call = Subtensor::add_stake(hot, netuid, amount)
     """
     args = _args_as_dict(call_args_raw)
 
@@ -949,9 +959,11 @@ def _is_our_execute_revealed(
         if bytes(signer_bytes) != bytes(cold_raw):
             return False
 
-    # nonce must match (32-bit)
-    nonce_v = _to_int(args.get("nonce"))
-    if nonce_v != (nonce_u32 & 0xFFFFFFFF):
+    # key_hash must match
+    key_hash_val = args.get("key_hash")
+    actual_key_hash = _normalize_hex_0x(key_hash_val)
+    target_key_hash = _normalize_hex_0x(expected_key_hash_hex)
+    if not actual_key_hash or not target_key_hash or actual_key_hash != target_key_hash:
         return False
 
     # inner call
@@ -1064,14 +1076,15 @@ def assert_no_mempool_reveal_for_stake(
     hot_ss58: str,
     netuid: int,
     amount_planck: int,
-    nonce_u32: int,
+    expected_key_hash_hex: str,
 ):
     """
     Pool-level MEV assertion:
 
     While we are waiting for the on-chain MevShield::execute_revealed,
     we require that the tx pool NEVER contains a MevShield::execute_revealed
-    extrinsic whose payload matches this stake (cold, hot, netuid, amount, nonce).
+    extrinsic whose payload matches this stake (cold, hot, netuid, amount,
+    key_hash).
     """
     pending_extrinsics = _iter_pending_extrinsics_decoded(substrate)
 
@@ -1090,7 +1103,7 @@ def assert_no_mempool_reveal_for_stake(
             hot_ss58=hot_ss58,
             netuid=netuid,
             amount_planck=amount_planck,
-            nonce_u32=nonce_u32,
+            expected_key_hash_hex=expected_key_hash_hex,
         ):
             raise RuntimeError(
                 "Pool-level MEV violation: MevShield::execute_revealed for this stake "
@@ -1112,7 +1125,7 @@ def assert_reveal_hidden(
     hot_ss58: str,
     netuid: int,
     amount_planck: int,
-    nonce_u32: int,
+    expected_key_hash_hex: str,
     commitment_hex: str,
     inclusion_block_hash: str,
     timeout_s: int = 180,
@@ -1137,13 +1150,34 @@ def assert_reveal_hidden(
       4. While waiting for the reveal block, the tx pool NEVER contains
          MevShield::execute_revealed for this stake.
 
-    Returns (submit_block_number, reveal_block_number).
+    The identity of "this stake" is determined by:
+      - (cold_ss58, hot_ss58, netuid, amount_planck, key_hash).
     """
     if not inclusion_block_hash:
         raise RuntimeError("Inclusion block hash is empty; cannot assert MEV safety")
 
+    print(f"[DBG] expected_key_hash_hex (client) = {expected_key_hash_hex}")
     submit_num = get_block_number(substrate, inclusion_block_hash)
     print(f"[i] submit_encrypted included in block #{submit_num} ({inclusion_block_hash})")
+
+    # Log CurrentKey / NextKey at submit block (runtime view)
+    try:
+        curr_at_submit = read_current_key_bytes(substrate, mev_pallet, inclusion_block_hash)
+        next_at_submit = read_next_key_bytes(substrate, mev_pallet, inclusion_block_hash)
+        curr_submit_hash = (
+            "0x" + blake2_256(curr_at_submit).hex() if curr_at_submit else "None"
+        )
+        next_submit_hash = (
+            "0x" + blake2_256(next_at_submit).hex() if next_at_submit else "None"
+        )
+        print(
+            f"[DBG] Runtime CurrentKey@submit block #{submit_num}: len={len(curr_at_submit)}, hash={curr_submit_hash}"
+        )
+        print(
+            f"[DBG] Runtime NextKey@submit block #{submit_num}:    len={len(next_at_submit)}, hash={next_submit_hash}"
+        )
+    except Exception as e:
+        print(f"[DBG] Failed to query CurrentKey/NextKey at submit block: {e}")
 
     # --- 1) Check inclusion block contents ---
     block = substrate.get_block(block_hash=inclusion_block_hash)
@@ -1172,7 +1206,7 @@ def assert_reveal_hidden(
                 hot_ss58=hot_ss58,
                 netuid=netuid,
                 amount_planck=amount_planck,
-                nonce_u32=nonce_u32,
+                expected_key_hash_hex=expected_key_hash_hex,
             ):
                 bad_inclusion.append(("MevShield::execute_revealed", idx))
 
@@ -1199,13 +1233,14 @@ def assert_reveal_hidden(
     # --- 2 & 4) Scan subsequent blocks and pool, asserting MEV‑hiding until reveal ---
     print(
         f"[i] Waiting for first MevShield::execute_revealed for "
-        f"(cold={cold_ss58}, hot={hot_ss58}, netuid={netuid}, amount={amount_planck}, nonce={nonce_u32})"
+        f"(cold={cold_ss58}, hot={hot_ss58}, netuid={netuid}, amount={amount_planck}, key_hash={expected_key_hash_hex})"
     )
 
     start = time.time()
     next_height = submit_num + 1
     reveal_block_num: Optional[int] = None
     reveal_xt_index: Optional[int] = None
+    reveal_block_hash: Optional[str] = None
 
     while time.time() - start < timeout_s:
         # Pool-level MEV assertion: our execute_revealed must NOT be in the tx pool.
@@ -1217,7 +1252,7 @@ def assert_reveal_hidden(
             hot_ss58=hot_ss58,
             netuid=netuid,
             amount_planck=amount_planck,
-            nonce_u32=nonce_u32,
+            expected_key_hash_hex=expected_key_hash_hex,
         )
 
         # Determine current head
@@ -1261,7 +1296,7 @@ def assert_reveal_hidden(
                         hot_ss58=hot_ss58,
                         netuid=netuid,
                         amount_planck=amount_planck,
-                        nonce_u32=nonce_u32,
+                        expected_key_hash_hex=expected_key_hash_hex,
                     )
                 ):
                     found_reveal = True
@@ -1289,6 +1324,7 @@ def assert_reveal_hidden(
                     )
                 reveal_block_num = next_height
                 reveal_xt_index = reveal_idx_here
+                reveal_block_hash = bh
                 print(
                     f"[i] MevShield::execute_revealed for our add_stake found in "
                     f"block #{next_height} (extrinsic index {reveal_xt_index})"
@@ -1325,6 +1361,26 @@ def assert_reveal_hidden(
             f"execute_revealed appeared at block #{reveal_block_num}, which is not strictly "
             f"after submit_encrypted block #{submit_num}; this violates delayed reveal."
         )
+
+    # Log CurrentKey / NextKey at reveal block (runtime view)
+    if reveal_block_hash is not None:
+        try:
+            curr_at_reveal = read_current_key_bytes(substrate, mev_pallet, reveal_block_hash)
+            next_at_reveal = read_next_key_bytes(substrate, mev_pallet, reveal_block_hash)
+            curr_reveal_hash = (
+                "0x" + blake2_256(curr_at_reveal).hex() if curr_at_reveal else "None"
+            )
+            next_reveal_hash = (
+                "0x" + blake2_256(next_at_reveal).hex() if next_at_reveal else "None"
+            )
+            print(
+                f"[DBG] Runtime CurrentKey@reveal block #{reveal_block_num}: len={len(curr_at_reveal)}, hash={curr_reveal_hash}"
+            )
+            print(
+                f"[DBG] Runtime NextKey@reveal block #{reveal_block_num}:    len={len(next_at_reveal)}, hash={next_reveal_hash}"
+            )
+        except Exception as e:
+            print(f"[DBG] Failed to query CurrentKey/NextKey at reveal block: {e}")
 
     print(
         f"[✓] MEV‑safe: execute_revealed for this stake appeared later in block #{reveal_block_num}, "
@@ -1417,7 +1473,32 @@ def main():
     call = compose_add_stake(substrate, subtensor, hot.ss58_address, netuid, amount_planck)
     call_bytes = call_to_scale_bytes(call)
 
-    # Build payload_core: (signer, nonce<u32>, Era::Immortal=0x00, call SCALE)
+    # Read the *announced next* ML‑KEM public key.
+    pk_bytes = acquire_next_key(substrate, mev_pallet)
+    if len(pk_bytes) != MLKEM768_PK_LEN:
+        raise RuntimeError(
+            f"NextKey length {len(pk_bytes)} != {MLKEM768_PK_LEN}"
+        )
+
+    print(
+        f"[DBG] Client view: NextKey len={len(pk_bytes)}, blake2_256=0x{blake2_256(pk_bytes).hex()}"
+    )
+    try:
+        curr_now = read_current_key_bytes(substrate, mev_pallet)
+        if curr_now:
+            print(
+                f"[DBG] Client view: CurrentKey len={len(curr_now)}, blake2_256=0x{blake2_256(curr_now).hex()}"
+            )
+        else:
+            print("[DBG] Client view: CurrentKey not set (len=0)")
+    except Exception as e:
+        print(f"[DBG] Failed to query CurrentKey at client time: {e}")
+
+    # key_hash = blake2_256(NextKey_bytes); this is what we sign and commit over.
+    key_hash_bytes = blake2_256(pk_bytes)
+    key_hash_hex = "0x" + key_hash_bytes.hex()
+
+    # Build payload_core: signer (32) || key_hash (32) || SCALE(call)
     signer_raw32 = ss58_decode(cold.ss58_address)
     if isinstance(signer_raw32, str) and signer_raw32.startswith("0x"):
         signer_raw32 = bytes.fromhex(signer_raw32[2:])
@@ -1428,30 +1509,38 @@ def main():
             signer_raw32 = bytes(32)
     signer_raw32 = bytes(signer_raw32)
 
-    nonce_u32 = account_nonce(substrate, cold.ss58_address) & 0xFFFFFFFF
-    payload_core = signer_raw32 + struct.pack("<I", nonce_u32) + call_bytes
+    payload_core = signer_raw32 + key_hash_bytes + call_bytes
+
+    print(
+        "[DBG] payload_core segments: "
+        f"signer_len={len(signer_raw32)}, key_hash_len={len(key_hash_bytes)}, "
+        f"call_len={len(call_bytes)}, total_len={len(payload_core)}"
+    )
+    print(f"[DBG] key_hash_hex (client payload) = {key_hash_hex}")
 
     # Domain-separated signature: "mev-shield:v1" || genesis || payload_core
     genesis = get_genesis_hash_bytes(substrate)
-    sig64 = cold.sign(b"mev-shield:v1" + genesis + payload_core)
+    msg = b"mev-shield:v1" + genesis + payload_core
+    sig64 = cold.sign(msg)
     multisig = b"\x01" + sig64
     plaintext = payload_core + multisig
 
-    # Read the *announced next* ML‑KEM public key (no epoch in storage anymore).
-    pk_bytes = acquire_next_key(substrate, mev_pallet)
-    if len(pk_bytes) != MLKEM768_PK_LEN:
-        raise RuntimeError(
-            f"NextKey length {len(pk_bytes)} != {MLKEM768_PK_LEN}"
-        )
+    print(f"[DBG] plaintext_len={len(plaintext)}")
 
     # Encrypt with Rust FFI (Kyber/ML‑KEM‑768 + XChaCha20-Poly1305),
     # AEAD key = shared_secret (must match node-side derive_aead_key).
     blob = mlkem768_seal_blob(pk_bytes, plaintext)
+    kem_len = int.from_bytes(blob[0:2], "little") if len(blob) >= 2 else None
+    print(
+        f"[DBG] ciphertext blob: total_len={len(blob)}, kem_len={kem_len}"
+    )
 
-    # Commitment over (signer, nonce, call)
+    # Commitment over (signer, key_hash, call)
     commitment_hex = "0x" + blake2_256(payload_core).hex()
 
-    print("[i] Using MevShield::NextKey (single Vec<u8> ML‑KEM public key; no on-chain epoch)")
+    print(f"[DBG] commitment_hex (client payload) = {commitment_hex}")
+
+    print("[i] Using MevShield::NextKey with key_hash = blake2_256(NextKey_bytes)")
 
     # Submit encrypted wrapper
     call_submit = compose_call(
@@ -1476,7 +1565,7 @@ def main():
         hot_ss58=hot.ss58_address,
         netuid=netuid,
         amount_planck=amount_planck,
-        nonce_u32=nonce_u32,
+        expected_key_hash_hex=key_hash_hex,
         commitment_hex=commitment_hex,
         inclusion_block_hash=rec.block_hash,
         timeout_s=args.timeout,
