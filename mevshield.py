@@ -1,67 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MEV‑Shield add_stake E2E:
-  • Reads MevShield::NextKey as Vec<u8>(1184) ML‑KEM public key
-  • Builds plaintext (signer, key_hash=blake2_256(NextKey), call, MultiSignature)
-  • Calls Rust FFI to produce blob:
-      [u16 kem_len=1088 LE][kem_ct 1088B][nonce24][aead_ct]
-  • Submits mev_shield::submit_encrypted
-  • Asserts MEV safety for this specific stake:
+MEV‑Shield add_stake E2E (v2, direct-extrinsic reveal):
+
+  • Reads MevShield::NextKey as Vec<u8>(1184) ML‑KEM public key.
+  • Builds a *normal signed extrinsic* for:
+        Subtensor::add_stake(hotkey=H, netuid=N, amount=A)
+    with signer C (cold account).
+  • commitment = blake2_256(signed_extrinsic_bytes).
+  • Plaintext for encryption is exactly the SCALE-encoded signed extrinsic:
+        plaintext = signed_extrinsic_bytes
+  • Encrypts plaintext with ML‑KEM‑768 + XChaCha20‑Poly1305 to:
+        blob = [u16 kem_len] || kem_ct || nonce24 || aead_ct
+  • Submits MevShield::submit_encrypted { commitment, ciphertext = blob }.
+  • The node’s author‑side workers decrypt the wrapper in the last window
+    of the slot, reconstruct the signed extrinsic, and submit it into the
+    local tx pool.
+  • The script asserts MEV‑hiding *at the block level* for this specific stake:
 
       Let the inner call be:
-        SubtensorModule::add_stake(hotkey=H, netuid=N, amount=A) with
-        signer C (cold account).
+        Subtensor::add_stake(hotkey=H, netuid=N, amount=A) with signer C.
 
       1. Inclusion block B_submit:
            - contains MevShield::submit_encrypted with our commitment,
-           - has NO plain Subtensor::add_stake(H, N, A'),
-           - has NO MevShield::execute_revealed carrying our add_stake.
+           - has NO plain Subtensor::add_stake(H, N, A) signed by C.
 
       2. For every block B > B_submit and < B_reveal:
-           - NO plain Subtensor::add_stake(H, N, A'),
-           - NO MevShield::execute_revealed carrying our add_stake.
+           - NO plain Subtensor::add_stake(H, N, A) signed by C.
 
       3. A later block B_reveal:
-           - contains MevShield::execute_revealed whose inner call is
-             exactly our add_stake(H, N, A) with signer C,
-           - still has NO plain Subtensor::add_stake(H, N, A').
+           - contains a plain Subtensor::add_stake(H, N, A) with signer C.
 
-      4. POOL‑LEVEL ASSERTION:
-           While waiting for B_reveal, at no time does the transaction
-           pool (author_pendingExtrinsics / get_pending_extrinsics)
-           contain a MevShield::execute_revealed for this stake.
-           I.e. our decrypted add_stake is never visible in the tx pool.
+  • The script does NOT assert that stake actually changed; only that the
+    first on‑chain plaintext representation of this stake appears later,
+    after an intermediate encrypted-only representation.
 
-  • Does NOT assert that stake changed; only MEV‑hiding properties.
+Crypto details (must match node):
 
-Crypto details:
-  • ML‑KEM‑768 (Kyber) for KEM
-  • XChaCha20‑Poly1305 for AEAD
-  • AEAD key = ML‑KEM shared secret (direct, 32 bytes; no HKDF)
-  • Signed payload uses key_hash = blake2_256(NextKey_bytes) instead
-    of an account nonce; replay protection is per‑key epoch.
-
-Dependencies:
-  python3 -m pip install --user substrate-interface
-
-Build FFI once:
-  cd mlkemffi && cargo build --release
-  (ensure the produced .so/.dylib/.dll is found by this script)
+  • ML‑KEM‑768 (Kyber) for KEM.
+  • XChaCha20‑Poly1305 for AEAD.
+  • Shared secret is 32 bytes.
+  • AEAD key = shared secret (direct, no HKDF).
+  • AAD = [] (empty).
+  • Ciphertext blob layout:
+        [u16 kem_len LE][kem_ct kem_len bytes][nonce24][aead_ct]
 """
 
 import argparse
 import ctypes
 import hashlib
 import os
-import struct
-import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.exceptions import SubstrateRequestException
-from substrateinterface.utils.ss58 import ss58_decode
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -265,9 +258,9 @@ def _normalize_hex_0x(v: Any) -> Optional[str]:
     return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────-
 # MevShield key access (NextKey / CurrentKey)
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────-
 
 
 def read_next_key_bytes(
@@ -412,14 +405,13 @@ def submit_signed(substrate, who: Keypair, call):
     return rec
 
 
-def get_genesis_hash_bytes(substrate: SubstrateInterface) -> bytes:
-    hx = substrate.get_block_hash(0)
-    return bytes.fromhex(hx[2:]) if isinstance(hx, str) and hx.startswith("0x") else bytes(32)
-
-
-def call_to_scale_bytes(call) -> bytes:
-    if hasattr(call, "data"):
-        d = call.data
+def call_to_scale_bytes(obj) -> bytes:
+    """
+    Obtain SCALE-encoded bytes from a call or extrinsic object produced by
+    py-substrate-interface.
+    """
+    if hasattr(obj, "data"):
+        d = obj.data
         if hasattr(d, "to_hex"):
             hx = d.to_hex()
             return bytes.fromhex(hx[2:] if hx.startswith("0x") else hx)
@@ -427,7 +419,8 @@ def call_to_scale_bytes(call) -> bytes:
             raw = d.data
             if isinstance(raw, (bytes, bytearray, memoryview)):
                 return bytes(raw)
-    enc = call.encode()
+
+    enc = getattr(obj, "encode", lambda: obj)()
     if hasattr(enc, "to_hex"):
         hx = enc.to_hex()
         return bytes.fromhex(hx[2:] if hx.startswith("0x") else hx)
@@ -437,7 +430,7 @@ def call_to_scale_bytes(call) -> bytes:
             return bytes(raw)
     if isinstance(enc, str) and enc.startswith("0x"):
         return bytes.fromhex(enc[2:])
-    raise RuntimeError("Could not obtain SCALE bytes for call")
+    raise RuntimeError("Could not obtain SCALE bytes")
 
 
 def _to_int(v: Any) -> Optional[int]:
@@ -474,11 +467,6 @@ def _to_int(v: Any) -> Optional[int]:
 def get_block_number(substrate: SubstrateInterface, block_hash: str) -> int:
     """
     Robustly get a block's number given its hash.
-
-    Handles both:
-      {'header': {'number': 605, ...}}
-    and:
-      {'number': '0x1234', ...}
     """
     try:
         header = substrate.get_block_header(block_hash=block_hash)
@@ -551,7 +539,9 @@ def transfer_keep_alive(
         except Exception:
             call = None
     if call is None:
-        raise RuntimeError("Could not compose Balances::transfer_keep_alive or Balances::transfer")
+        raise RuntimeError(
+            "Could not compose Balances::transfer_keep_alive or Balances::transfer"
+        )
 
     try:
         submit_signed(substrate, signer, call)
@@ -595,7 +585,9 @@ def ensure_funded_planck(
 # ─────────────────────────────────────────────────────────────────────────────-
 
 
-def networks_added_dynamic(substrate: SubstrateInterface, subtensor_pallet: str) -> List[int]:
+def networks_added_dynamic(
+    substrate: SubstrateInterface, subtensor_pallet: str
+) -> List[int]:
     """
     Read all netuids from SubtensorModule::NetworksAdded (or equivalent).
     """
@@ -726,58 +718,8 @@ def ensure_subnet_exists_or_register(
         {"hotkey": owner_hot_ss58},
     )
 
-    attempts = 0
-    while True:
-        attempts += 1
-        try:
-            rec = submit_signed(substrate, owner_cold, call)
-            print(f"[i] register_network submitted in block {rec.block_hash}")
-            break
-        except RuntimeError as e:
-            msg = str(e)
-            if "CannotAffordLockCost" in msg:
-                # We still don't have enough for the lock; fund more and retry.
-                bal = account_free_balance(substrate, owner_cold.ss58_address)
-                extra_min = bal * 3 + int(1_000 * (10 ** decimals))
-                print(
-                    "[i] register_network failed with CannotAffordLockCost; "
-                    f"increasing owner_cold funds to at least {extra_min} planck and retrying."
-                )
-                ensure_funded_planck(
-                    substrate,
-                    faucet,
-                    owner_cold.ss58_address,
-                    extra_min,
-                    label="owner_cold (lock retry)",
-                )
-                if attempts >= 4:
-                    raise RuntimeError(
-                        "Unable to satisfy subnet lock cost after multiple funding attempts; "
-                        "check faucet balance or runtime config."
-                    ) from e
-                continue
-            if "Priority is too low" in msg or "code': 1014" in msg or "1014" in msg:
-                print(
-                    "[i] register_network: tx with same nonce already in pool (1014). "
-                    "Will wait for subnet to appear in NetworksAdded."
-                )
-                start = time.time()
-                while time.time() - start < 60:
-                    after = set(networks_added_dynamic(substrate, subtensor_pallet))
-                    new_nets = sorted(after - before)
-                    if new_nets:
-                        new_net = new_nets[-1]
-                        print(
-                            f"[i] New subnet {new_net} detected in NetworksAdded after pending "
-                            "register_network."
-                        )
-                        return new_net, True
-                    time.sleep(1.0)
-                raise RuntimeError(
-                    "register_network tx appears duplicated in pool (1014) but subnet did not "
-                    "appear in NetworksAdded within 60s."
-                ) from e
-            raise
+    rec = submit_signed(substrate, owner_cold, call)
+    print(f"[i] register_network submitted in block {rec.block_hash}")
 
     after = set(networks_added_dynamic(substrate, subtensor_pallet))
     new_nets = sorted(after - before)
@@ -893,6 +835,28 @@ def _args_as_dict(args_raw: Any) -> Dict[str, Any]:
     return out
 
 
+def _extract_extrinsic_signer_ss58(raw: Any) -> Optional[str]:
+    """
+    Try to extract the signer SS58 address from an extrinsic value as returned by
+    substrate.get_block().
+    """
+    if hasattr(raw, "value"):
+        raw = raw.value
+    if not isinstance(raw, dict):
+        return None
+
+    # py-substrate-interface typically exposes 'address' for the signer
+    addr = raw.get("address")
+    if isinstance(addr, str):
+        return addr
+
+    signer = raw.get("signer")
+    if isinstance(signer, str):
+        return signer
+
+    return None
+
+
 def _is_plain_add_stake_for_tx(
     call_args_raw: Any,
     hot_ss58: str,
@@ -921,76 +885,6 @@ def _is_plain_add_stake_for_tx(
     return amount_v >= amount_planck
 
 
-def _is_our_execute_revealed(
-    call_args_raw: Any,
-    subtensor_pallet: str,
-    cold_ss58: str,
-    hot_ss58: str,
-    netuid: int,
-    amount_planck: int,
-    expected_key_hash_hex: str,
-) -> bool:
-    """
-    Check whether MevShield::execute_revealed's call_args correspond
-    to *our* encrypted add_stake plaintext, identified by:
-      * signer (cold_ss58)
-      * key_hash (blake2_256(NextKey_bytes) at submit time)
-      * inner call = Subtensor::add_stake(hot, netuid, amount)
-    """
-    args = _args_as_dict(call_args_raw)
-
-    # signer: cold account
-    signer = args.get("signer")
-    if isinstance(signer, str):
-        if signer != cold_ss58:
-            return False
-    else:
-        signer_bytes = _parse_vec_u8(signer)
-        if signer_bytes is None:
-            return False
-        try:
-            cold_raw = ss58_decode(cold_ss58)
-            if isinstance(cold_raw, str) and cold_raw.startswith("0x"):
-                cold_raw = bytes.fromhex(cold_raw[2:])
-            elif isinstance(cold_raw, str):
-                cold_raw = bytes.fromhex(cold_raw)
-        except Exception:
-            return False
-        if bytes(signer_bytes) != bytes(cold_raw):
-            return False
-
-    # key_hash must match
-    key_hash_val = args.get("key_hash")
-    actual_key_hash = _normalize_hex_0x(key_hash_val)
-    target_key_hash = _normalize_hex_0x(expected_key_hash_hex)
-    if not actual_key_hash or not target_key_hash or actual_key_hash != target_key_hash:
-        return False
-
-    # inner call
-    inner_call_raw = args.get("call")
-    inner_module, inner_fn, inner_args_raw = _extract_call_from_raw(inner_call_raw)
-    if inner_module != subtensor_pallet or inner_fn != "add_stake":
-        return False
-
-    inner_args = _args_as_dict(inner_args_raw)
-    if inner_args.get("hotkey") != hot_ss58:
-        return False
-
-    inner_netuid = _to_int(inner_args.get("netuid"))
-    if inner_netuid != netuid:
-        return False
-
-    inner_amount = _to_int(
-        inner_args.get("amount_staked")
-        or inner_args.get("amount")
-        or inner_args.get("value")
-    )
-    if inner_amount != amount_planck:
-        return False
-
-    return True
-
-
 def _is_our_submit_encrypted(
     module: Optional[str],
     fn: Optional[str],
@@ -1014,106 +908,7 @@ def _is_our_submit_encrypted(
 
 
 # ─────────────────────────────────────────────────────────────────────────────-
-# Tx pool (mempool) helpers for pool-level MEV assertions
-# ─────────────────────────────────────────────────────────────────────────────-
-
-
-def _iter_pending_extrinsics_decoded(substrate: SubstrateInterface):
-    """
-    Return a list of decoded pending extrinsics from the local tx pool.
-    Tries substrate.get_pending_extrinsics() first, falls back to
-    author_pendingExtrinsics RPC, and decodes hex SCALE 'Extrinsic'
-    where needed.
-    """
-    pending_raw = None
-
-    # Prefer high-level helper if available.
-    get_pending = getattr(substrate, "get_pending_extrinsics", None)
-    if callable(get_pending):
-        try:
-            pending_raw = get_pending()
-        except Exception:
-            pending_raw = None
-
-    if pending_raw is None:
-        try:
-            resp = substrate.rpc_request("author_pendingExtrinsics", [])
-            if isinstance(resp, dict) and "result" in resp:
-                pending_raw = resp["result"]
-            else:
-                pending_raw = resp
-        except Exception as e:
-            raise RuntimeError(
-                "Tx pool RPC 'author_pendingExtrinsics' unavailable; "
-                "cannot assert pool-level MEV safety."
-            ) from e
-
-    if pending_raw is None:
-        return []
-
-    decoded_list = []
-    for item in pending_raw:
-        # substrate.get_pending_extrinsics may already return decoded objects.
-        if not isinstance(item, str) or not item.startswith("0x"):
-            decoded_list.append(item)
-            continue
-        try:
-            scale_obj = substrate.create_scale_object("Extrinsic", data=item)
-            decoded = scale_obj.decode()
-            decoded_list.append(decoded)
-        except Exception:
-            # Best-effort; ignore malformed entries.
-            continue
-
-    return decoded_list
-
-
-def assert_no_mempool_reveal_for_stake(
-    substrate: SubstrateInterface,
-    mev_pallet: str,
-    subtensor_pallet: str,
-    cold_ss58: str,
-    hot_ss58: str,
-    netuid: int,
-    amount_planck: int,
-    expected_key_hash_hex: str,
-):
-    """
-    Pool-level MEV assertion:
-
-    While we are waiting for the on-chain MevShield::execute_revealed,
-    we require that the tx pool NEVER contains a MevShield::execute_revealed
-    extrinsic whose payload matches this stake (cold, hot, netuid, amount,
-    key_hash).
-    """
-    pending_extrinsics = _iter_pending_extrinsics_decoded(substrate)
-
-    for ext in pending_extrinsics:
-        raw = getattr(ext, "value", ext)
-        module, fn, args_raw = _extract_call_from_raw(raw)
-        if module is None:
-            continue
-        if module.lower() != mev_pallet.lower() or fn != "execute_revealed":
-            continue
-
-        if _is_our_execute_revealed(
-            args_raw,
-            subtensor_pallet=subtensor_pallet,
-            cold_ss58=cold_ss58,
-            hot_ss58=hot_ss58,
-            netuid=netuid,
-            amount_planck=amount_planck,
-            expected_key_hash_hex=expected_key_hash_hex,
-        ):
-            raise RuntimeError(
-                "Pool-level MEV violation: MevShield::execute_revealed for this stake "
-                "was observed in the tx pool BEFORE it appeared on-chain. "
-                "This would expose the decrypted inner add_stake to MEV searchers."
-            )
-
-
-# ─────────────────────────────────────────────────────────────────────────────-
-# High-level MEV assertions (blocks + pool)
+# High-level MEV assertions (blocks only, no pool)
 # ─────────────────────────────────────────────────────────────────────────────-
 
 
@@ -1125,38 +920,29 @@ def assert_reveal_hidden(
     hot_ss58: str,
     netuid: int,
     amount_planck: int,
-    expected_key_hash_hex: str,
     commitment_hex: str,
     inclusion_block_hash: str,
     timeout_s: int = 180,
     poll_s: float = 0.8,
 ) -> Tuple[int, int]:
     """
-    Strong MEV‑safety assertion for this specific encrypted add_stake.
+    MEV‑hiding assertion for this specific encrypted add_stake, assuming the
+    plaintext is a *full signed extrinsic*:
 
-      1. Inclusion block:
-           - contains our MevShield::submit_encrypted(commitment),
-           - has NO plain Subtensor::add_stake for this stake,
-           - has NO MevShield::execute_revealed for this stake.
+      1. The inclusion block contains our MevShield::submit_encrypted(commitment)
+         and NO plain Subtensor::add_stake for (cold, hot, netuid, amount).
 
-      2. For every block after inclusion and before reveal:
-           - NO plain Subtensor::add_stake for this stake,
-           - NO MevShield::execute_revealed for this stake.
+      2. For all blocks after inclusion and before reveal there is NO such
+         plain Subtensor::add_stake.
 
-      3. A later block contains MevShield::execute_revealed whose inner call
-         is our Subtensor::add_stake, and that block still has no plain
-         add_stake for this stake.
+      3. A strictly later block contains a plain Subtensor::add_stake with
+         (hot, netuid, amount) and signer == cold.
 
-      4. While waiting for the reveal block, the tx pool NEVER contains
-         MevShield::execute_revealed for this stake.
-
-    The identity of "this stake" is determined by:
-      - (cold_ss58, hot_ss58, netuid, amount_planck, key_hash).
+    Returns (submit_block_number, reveal_block_number).
     """
     if not inclusion_block_hash:
         raise RuntimeError("Inclusion block hash is empty; cannot assert MEV safety")
 
-    print(f"[DBG] expected_key_hash_hex (client) = {expected_key_hash_hex}")
     submit_num = get_block_number(substrate, inclusion_block_hash)
     print(f"[i] submit_encrypted included in block #{submit_num} ({inclusion_block_hash})")
 
@@ -1189,26 +975,23 @@ def assert_reveal_hidden(
     for idx, ext in enumerate(extrinsics):
         raw = getattr(ext, "value", ext)
         module, fn, args_raw = _extract_call_from_raw(raw)
+        signer_ss58 = _extract_extrinsic_signer_ss58(raw)
 
         # Locate our submit_encrypted
         if _is_our_submit_encrypted(module, fn, args_raw, mev_pallet, commitment_hex):
             submit_idx = idx
 
-        # Look for visible leaks in inclusion block
-        if module and module.lower() == subtensor_pallet.lower() and fn == "add_stake":
-            if _is_plain_add_stake_for_tx(args_raw, hot_ss58, netuid, amount_planck):
-                bad_inclusion.append(("Subtensor::add_stake", idx))
-        if module and module.lower() == mev_pallet.lower() and fn == "execute_revealed":
-            if _is_our_execute_revealed(
-                args_raw,
-                subtensor_pallet=subtensor_pallet,
-                cold_ss58=cold_ss58,
-                hot_ss58=hot_ss58,
-                netuid=netuid,
-                amount_planck=amount_planck,
-                expected_key_hash_hex=expected_key_hash_hex,
-            ):
-                bad_inclusion.append(("MevShield::execute_revealed", idx))
+        # Look for visible leaks in inclusion block: a plain add_stake for *this* stake.
+        if (
+            module
+            and module.lower() == subtensor_pallet.lower()
+            and fn == "add_stake"
+            and signer_ss58 == cold_ss58
+            and _is_plain_add_stake_for_tx(
+                args_raw, hot_ss58=hot_ss58, netuid=netuid, amount_planck=amount_planck
+            )
+        ):
+            bad_inclusion.append(("Subtensor::add_stake", idx))
 
     if submit_idx is None:
         raise RuntimeError(
@@ -1227,13 +1010,13 @@ def assert_reveal_hidden(
 
     print(
         f"[✓] Inclusion block #{submit_num} contains only encrypted payload for this stake; "
-        "no visible Subtensor::add_stake or MevShield::execute_revealed."
+        "no visible Subtensor::add_stake."
     )
 
-    # --- 2 & 4) Scan subsequent blocks and pool, asserting MEV‑hiding until reveal ---
+    # --- 2) Scan subsequent blocks until reveal ---
     print(
-        f"[i] Waiting for first MevShield::execute_revealed for "
-        f"(cold={cold_ss58}, hot={hot_ss58}, netuid={netuid}, amount={amount_planck}, key_hash={expected_key_hash_hex})"
+        f"[i] Waiting for first plain Subtensor::add_stake for "
+        f"(cold={cold_ss58}, hot={hot_ss58}, netuid={netuid}, amount={amount_planck})"
     )
 
     start = time.time()
@@ -1243,18 +1026,6 @@ def assert_reveal_hidden(
     reveal_block_hash: Optional[str] = None
 
     while time.time() - start < timeout_s:
-        # Pool-level MEV assertion: our execute_revealed must NOT be in the tx pool.
-        assert_no_mempool_reveal_for_stake(
-            substrate=substrate,
-            mev_pallet=mev_pallet,
-            subtensor_pallet=subtensor_pallet,
-            cold_ss58=cold_ss58,
-            hot_ss58=hot_ss58,
-            netuid=netuid,
-            amount_planck=amount_planck,
-            expected_key_hash_hex=expected_key_hash_hex,
-        )
-
         # Determine current head
         try:
             head_hash = substrate.get_chain_head()
@@ -1267,6 +1038,8 @@ def assert_reveal_hidden(
             time.sleep(poll_s)
             continue
 
+        found_reveal_here = False
+
         while next_height <= head_num:
             bh = substrate.get_block_hash(next_height)
             if not bh:
@@ -1275,37 +1048,19 @@ def assert_reveal_hidden(
 
             blk = substrate.get_block(block_hash=bh)
             exts = blk.get("extrinsics") or blk.get("extrinsic") or []
-            found_plain = False
-            found_reveal = False
+            found_add = False
             reveal_idx_here: Optional[int] = None
 
             for idx, ext in enumerate(exts):
                 raw = getattr(ext, "value", ext)
                 module, fn, args_raw = _extract_call_from_raw(raw)
-                if module is None:
-                    continue
+                signer_ss58 = _extract_extrinsic_signer_ss58(raw)
 
-                # Check for execute_revealed for THIS stake
                 if (
-                    module.lower() == mev_pallet.lower()
-                    and fn == "execute_revealed"
-                    and _is_our_execute_revealed(
-                        args_raw,
-                        subtensor_pallet=subtensor_pallet,
-                        cold_ss58=cold_ss58,
-                        hot_ss58=hot_ss58,
-                        netuid=netuid,
-                        amount_planck=amount_planck,
-                        expected_key_hash_hex=expected_key_hash_hex,
-                    )
-                ):
-                    found_reveal = True
-                    reveal_idx_here = idx
-
-                # Check for plain on-chain add_stake for THIS stake
-                if (
-                    module.lower() == subtensor_pallet.lower()
+                    module
+                    and module.lower() == subtensor_pallet.lower()
                     and fn == "add_stake"
+                    and signer_ss58 == cold_ss58
                     and _is_plain_add_stake_for_tx(
                         args_raw,
                         hot_ss58=hot_ss58,
@@ -1313,52 +1068,42 @@ def assert_reveal_hidden(
                         amount_planck=amount_planck,
                     )
                 ):
-                    found_plain = True
+                    found_add = True
+                    reveal_idx_here = idx
+                    break
 
-            if found_reveal:
-                # Reveal block: still MUST NOT have plain add_stake for this stake.
-                if found_plain:
-                    raise RuntimeError(
-                        f"Block #{next_height} contains both execute_revealed and a plain "
-                        "Subtensor::add_stake for this stake; this would leak plaintext."
-                    )
+            if found_add:
                 reveal_block_num = next_height
                 reveal_xt_index = reveal_idx_here
                 reveal_block_hash = bh
                 print(
-                    f"[i] MevShield::execute_revealed for our add_stake found in "
+                    f"[i] Plain Subtensor::add_stake for our stake found in "
                     f"block #{next_height} (extrinsic index {reveal_xt_index})"
                 )
+                found_reveal_here = True
                 break
             else:
-                # No reveal yet: we must not see a plain add_stake.
-                if found_plain:
-                    raise RuntimeError(
-                        f"Plain Subtensor::add_stake for this stake detected in block #{next_height} "
-                        "BEFORE execute_revealed. This would make the transaction MEV-visible."
-                    )
-
                 print(
                     f"[✓] Block #{next_height}: this stake is still MEV‑hidden "
-                    f"(no visible Subtensor::add_stake or MevShield::execute_revealed)."
+                    f"(no visible Subtensor::add_stake for this (cold,hot,netuid,amount))."
                 )
 
             next_height += 1
 
-        if reveal_block_num is not None:
+        if found_reveal_here:
             break
 
         time.sleep(poll_s)
 
     if reveal_block_num is None:
         raise RuntimeError(
-            f"Timed out ({timeout_s}s) while waiting for MevShield::execute_revealed "
+            f"Timed out ({timeout_s}s) while waiting for plain Subtensor::add_stake "
             "for this add_stake."
         )
 
     if reveal_block_num <= submit_num:
         raise RuntimeError(
-            f"execute_revealed appeared at block #{reveal_block_num}, which is not strictly "
+            f"add_stake appeared at block #{reveal_block_num}, which is not strictly "
             f"after submit_encrypted block #{submit_num}; this violates delayed reveal."
         )
 
@@ -1383,13 +1128,8 @@ def assert_reveal_hidden(
             print(f"[DBG] Failed to query CurrentKey/NextKey at reveal block: {e}")
 
     print(
-        f"[✓] MEV‑safe: execute_revealed for this stake appeared later in block #{reveal_block_num}, "
-        f"after encrypted submit_encrypted in block #{submit_num}."
-    )
-
-    print(
-        f"[✓] Pool-level MEV check: no MevShield::execute_revealed for this stake was ever "
-        f"observed in the tx pool prior to block #{reveal_block_num}."
+        f"[✓] MEV‑safe (block-level): plain add_stake for this stake appeared later in block "
+        f"#{reveal_block_num}, after encrypted submit_encrypted in block #{submit_num}."
     )
 
     return submit_num, reveal_block_num
@@ -1404,15 +1144,15 @@ def main():
     ap = argparse.ArgumentParser(
         description=(
             "MEV‑Shield add_stake using MevShield::NextKey (Vec<u8> ML‑KEM public key) and "
-            "asserting that the inner add_stake stays MEV‑hidden until reveal, "
-            "including pool-level (tx pool) visibility."
+            "asserting that the inner add_stake is first represented on-chain in encrypted "
+            "form (submit_encrypted) and only later as a plain Subtensor::add_stake extrinsic."
         )
     )
     ap.add_argument("--ws", default="ws://127.0.0.1:9945")
     ap.add_argument("--netuid", type=int, default=3)
     ap.add_argument("--stake", type=float, default=5.0, help="Stake in TAO to add")
     ap.add_argument("--author-uri", default="//Eve", help="Wrapper fee payer")
-    ap.add_argument("--cold-uri", default="//OwnerCold", help="Inner signer (signs plaintext)")
+    ap.add_argument("--cold-uri", default="//OwnerCold", help="Inner signer (signs extrinsic)")
     ap.add_argument("--hot-uri", default="//Staker1Hot", help="Target hotkey")
     ap.add_argument("--timeout", type=int, default=180)
     args = ap.parse_args()
@@ -1469,16 +1209,19 @@ def main():
         pass
     print(f"[i] stake_before (net {netuid}): {stake_before}")
 
-    # Compose inner add_stake
+    # Compose inner add_stake call
     call = compose_add_stake(substrate, subtensor, hot.ss58_address, netuid, amount_planck)
-    call_bytes = call_to_scale_bytes(call)
+
+    # Build a *normal signed extrinsic* (cold signer) that we will encrypt as plaintext.
+    inner_xt = substrate.create_signed_extrinsic(call=call, keypair=cold, era="00")
+    inner_xt_bytes = call_to_scale_bytes(inner_xt)
+
+    print(f"[DBG] inner signed extrinsic: len={len(inner_xt_bytes)} bytes")
 
     # Read the *announced next* ML‑KEM public key.
     pk_bytes = acquire_next_key(substrate, mev_pallet)
     if len(pk_bytes) != MLKEM768_PK_LEN:
-        raise RuntimeError(
-            f"NextKey length {len(pk_bytes)} != {MLKEM768_PK_LEN}"
-        )
+        raise RuntimeError(f"NextKey length {len(pk_bytes)} != {MLKEM768_PK_LEN}")
 
     print(
         f"[DBG] Client view: NextKey len={len(pk_bytes)}, blake2_256=0x{blake2_256(pk_bytes).hex()}"
@@ -1494,53 +1237,18 @@ def main():
     except Exception as e:
         print(f"[DBG] Failed to query CurrentKey at client time: {e}")
 
-    # key_hash = blake2_256(NextKey_bytes); this is what we sign and commit over.
-    key_hash_bytes = blake2_256(pk_bytes)
-    key_hash_hex = "0x" + key_hash_bytes.hex()
+    # commitment = blake2_256(signed_extrinsic_bytes)
+    commitment_bytes = blake2_256(inner_xt_bytes)
+    commitment_hex = "0x" + commitment_bytes.hex()
 
-    # Build payload_core: signer (32) || key_hash (32) || SCALE(call)
-    signer_raw32 = ss58_decode(cold.ss58_address)
-    if isinstance(signer_raw32, str) and signer_raw32.startswith("0x"):
-        signer_raw32 = bytes.fromhex(signer_raw32[2:])
-    elif isinstance(signer_raw32, str):
-        try:
-            signer_raw32 = bytes.fromhex(signer_raw32)
-        except Exception:
-            signer_raw32 = bytes(32)
-    signer_raw32 = bytes(signer_raw32)
+    print(f"[DBG] commitment_hex (extrinsic bytes) = {commitment_hex}")
 
-    payload_core = signer_raw32 + key_hash_bytes + call_bytes
-
-    print(
-        "[DBG] payload_core segments: "
-        f"signer_len={len(signer_raw32)}, key_hash_len={len(key_hash_bytes)}, "
-        f"call_len={len(call_bytes)}, total_len={len(payload_core)}"
-    )
-    print(f"[DBG] key_hash_hex (client payload) = {key_hash_hex}")
-
-    # Domain-separated signature: "mev-shield:v1" || genesis || payload_core
-    genesis = get_genesis_hash_bytes(substrate)
-    msg = b"mev-shield:v1" + genesis + payload_core
-    sig64 = cold.sign(msg)
-    multisig = b"\x01" + sig64
-    plaintext = payload_core + multisig
-
-    print(f"[DBG] plaintext_len={len(plaintext)}")
-
-    # Encrypt with Rust FFI (Kyber/ML‑KEM‑768 + XChaCha20-Poly1305),
-    # AEAD key = shared_secret (must match node-side derive_aead_key).
-    blob = mlkem768_seal_blob(pk_bytes, plaintext)
+    # Encrypt plaintext = signed extrinsic bytes with Rust FFI (Kyber/ML‑KEM‑768 + XChaCha20-Poly1305)
+    blob = mlkem768_seal_blob(pk_bytes, inner_xt_bytes)
     kem_len = int.from_bytes(blob[0:2], "little") if len(blob) >= 2 else None
-    print(
-        f"[DBG] ciphertext blob: total_len={len(blob)}, kem_len={kem_len}"
-    )
+    print(f"[DBG] ciphertext blob: total_len={len(blob)}, kem_len={kem_len}")
 
-    # Commitment over (signer, key_hash, call)
-    commitment_hex = "0x" + blake2_256(payload_core).hex()
-
-    print(f"[DBG] commitment_hex (client payload) = {commitment_hex}")
-
-    print("[i] Using MevShield::NextKey with key_hash = blake2_256(NextKey_bytes)")
+    print("[i] Using MevShield::NextKey and commitment = blake2_256(signed_extrinsic_bytes)")
 
     # Submit encrypted wrapper
     call_submit = compose_call(
@@ -1555,8 +1263,7 @@ def main():
     rec = submit_signed(substrate, author, call_submit)
     print(f"[✓] submit_encrypted accepted; block={rec.block_hash}")
 
-    # MEV‑safety assertion: encrypted-only representation until later execute_revealed,
-    # and no pool-level execute_revealed for this stake.
+    # MEV‑safety assertion: encrypted-only representation until later plain add_stake.
     submit_num, reveal_num = assert_reveal_hidden(
         substrate=substrate,
         mev_pallet=mev_pallet,
@@ -1565,7 +1272,6 @@ def main():
         hot_ss58=hot.ss58_address,
         netuid=netuid,
         amount_planck=amount_planck,
-        expected_key_hash_hex=key_hash_hex,
         commitment_hex=commitment_hex,
         inclusion_block_hash=rec.block_hash,
         timeout_s=args.timeout,
@@ -1574,7 +1280,7 @@ def main():
 
     print(
         f"[i] MEV‑Shield flow: submit_encrypted in block #{submit_num}, "
-        f"execute_revealed in block #{reveal_num}"
+        f"plain add_stake in block #{reveal_num}"
     )
 
     # Optional: show stake_after (informational only; NO assertion)
@@ -1587,11 +1293,10 @@ def main():
     print(f"[i] stake_after (net {netuid}): {stake_after}")
 
     print(
-        "✅ PASS: MEV‑Shield behaviour verified — for this stake, the only on-chain "
-        "representation before reveal was the encrypted submit_encrypted, the first "
-        "visible inner add_stake appeared only inside MevShield::execute_revealed in a "
-        "strictly later block, and no MevShield::execute_revealed for this stake was "
-        "ever present in the tx pool before that reveal."
+        "✅ PASS: MEV‑Shield behaviour verified — for this stake, the first on-chain "
+        "representation was the encrypted submit_encrypted wrapper; the first visible "
+        "plain Subtensor::add_stake for (cold, hot, netuid, amount) appeared only in a "
+        "later block."
     )
 
 
