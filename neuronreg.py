@@ -23,6 +23,8 @@ This version fixes:
       - retries metadata/signing reads safely
       - reconnects and re-submits the same signed extrinsic after transport loss
       - recovers receipts from recent finalized blocks when the websocket drops
+7) Burn config writes (BurnHalfLife / BurnIncreaseMult / MinBurn / MaxBurn)
+   are signed by the subnet owner key instead of being wrapped in root sudo.
 
 Thread-safety note
 ------------------
@@ -43,13 +45,19 @@ At on_initialize(current_block):
      where factor_q32 is the largest Q32 value such that:
        factor_q32 ^ BurnHalfLife <= 0.5
 
-  2) RegistrationsThisBlock = 0
+  2) burn is clamped into [MinBurn, MaxBurn]
+
+  3) RegistrationsThisBlock = 0
 
 At each successful non-root registration in block N:
 
   1) the current burn is charged
   2) RegistrationsThisBlock += 1
-  3) burn *= BurnIncreaseMult immediately in the registration path
+  3) burn = clamp(floor(burn * BurnIncreaseMult), MinBurn, MaxBurn)
+
+BurnIncreaseMult is stored on-chain as U64F64, so this script encodes and
+decodes it as raw fixed-point u128 bits and simulates the exact integer floor
+behavior used by saturating_to_num::<u64>().
 
 Scenarios per network
 ---------------------
@@ -77,8 +85,19 @@ Optional) Default-parameter stress scenario:
      for every registration in that same block
    - verifies the following block only decays from the post-batch burn
 
-3) BurnHalfLife=4, BurnIncreaseMult=2
-4) BurnHalfLife=8, BurnIncreaseMult=3
+3) BurnHalfLife=4, BurnIncreaseMult=2.0 (U64F64)
+4) BurnHalfLife=8, BurnIncreaseMult=3.0 (U64F64)
+5) Clamp scenario: sets BurnHalfLife=1, BurnIncreaseMult=1.5, and explicit
+   MinBurn / MaxBurn bounds on the active subnet (or a scratch subnet only if
+   the current burn is zero) to verify both lower and upper burn clamps
+
+Burn-config mutation path
+-------------------------
+BurnHalfLife / BurnIncreaseMult / MinBurn / MaxBurn updates are submitted by a
+resolved subnet-owner signer (coldkey or hotkey when that local key is what the
+node recognizes), not through Sudo. The script matches local dev keys against
+SubnetOwner / SubnetOwnerHotkey storage, and also supports explicit owner URI
+overrides via --owner-uris / --owner-hot-uris.
 """
 
 import sys
@@ -87,6 +106,7 @@ import ast
 import re
 import argparse
 import traceback
+from decimal import Decimal, ROUND_FLOOR
 from dataclasses import dataclass, replace
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -100,10 +120,28 @@ from substrateinterface.exceptions import SubstrateRequestException
 # ─────────────────────────────────────────────────────────────
 DEFAULT_WS = "ws://127.0.0.1:9945"
 
-TEST_CONFIGS: List[Tuple[int, int]] = [
-    (4, 2),
-    (8, 3),
+TEST_CONFIGS: List[Tuple[int, str]] = [
+    (4, "2"),
+    (8, "3"),
 ]
+
+CLAMP_TEST_HALF_LIFE = 1
+CLAMP_TEST_MULT = "1.5"
+
+U64_MAX = (1 << 64) - 1
+U128_MAX = (1 << 128) - 1
+ONE_Q32 = 1 << 32
+HALF_Q32 = 1 << 31
+U64F64_FRAC_BITS = 64
+ONE_U64F64 = 1 << U64F64_FRAC_BITS
+
+CUSTOM_TYPE_REGISTRY = {
+    "types": {
+        "U64F64": "u128",
+        "substrate_fixed::types::U64F64": "u128",
+        "FixedU128<U64>": "u128",
+    }
+}
 
 STRESS_TARGET_TOTAL_REGS = 20
 NEXT_REG_BALANCE_SAFETY_MULT = 4
@@ -116,15 +154,20 @@ MIN_ONE_REG_BUFFER_TAO = 1.0
 DEFAULT_STRESS_POST_DECAY_STEPS = 60
 SAME_BLOCK_MULTI_REG_COUNT = 10
 
-REGISTER_NETWORK_MIN_OWNER_COLD_TAO = 5000.0
+REGISTER_NETWORK_MIN_OWNER_COLD_TAO = 50_000.0
 REGISTER_NETWORK_MIN_OWNER_HOT_TAO = 5.0
 
 PALLET_SUBTENSOR = "SubtensorModule"
 PALLET_ADMIN = "AdminUtils"
 
-U64_MAX = (1 << 64) - 1
-ONE_Q32 = 1 << 32
-HALF_Q32 = 1 << 31
+OWNER_DEV_FALLBACK_URIS: List[Tuple[str, str]] = [
+    ("alice", "//Alice"),
+    ("bob", "//Bob"),
+    ("charlie", "//Charlie"),
+    ("dave", "//Dave"),
+    ("eve", "//Eve"),
+    ("ferdie", "//Ferdie"),
+]
 
 # Only bootstrap is safe to auto-retry. Stateful stages should not replay.
 STAGE_RETRY_ATTEMPTS = 3
@@ -139,9 +182,16 @@ SUBMIT_RETRY_BACKOFF_SEC = 0.35
 RECOVERY_SEARCH_FINALIZED_DEPTH = 128
 RECOVERY_SEARCH_PASSES = 8
 RECOVERY_SEARCH_SLEEP_SEC = 0.35
+CONFIG_VERIFY_ATTEMPTS = 3
+CONFIG_VERIFY_BACKOFF_SEC = 0.25
 
 ALICE_LOCK = Lock()
 PRINT_LOCK = Lock()
+NETWORK_CREATION_LOCK = Lock()
+OWNER_CONFIG_LOCK = Lock()
+OWNER_REGISTRY_LOCK = Lock()
+KNOWN_SUBNET_OWNER_COLD_URIS: Dict[int, str] = {}
+KNOWN_SUBNET_OWNER_HOT_URIS: Dict[int, str] = {}
 
 # Global lock for all substrate-interface access.
 SUBSTRATE_IO_LOCK = Lock()
@@ -157,6 +207,8 @@ class NetworkContext:
     decimals: int
     run_nonce: int
     payer_uri: str
+    owner_cold_uri: Optional[str] = None
+    owner_hot_uri: Optional[str] = None
 
 
 @dataclass
@@ -166,6 +218,22 @@ class RecoveredReceipt:
     error_message: str = ""
     recovered: bool = True
     submitted_extrinsic_hex: str = ""
+
+
+def remember_subnet_owner_uris(netuid: int, cold_uri: Optional[str] = None, hot_uri: Optional[str] = None):
+    with OWNER_REGISTRY_LOCK:
+        if cold_uri:
+            KNOWN_SUBNET_OWNER_COLD_URIS[int(netuid)] = str(cold_uri)
+        if hot_uri:
+            KNOWN_SUBNET_OWNER_HOT_URIS[int(netuid)] = str(hot_uri)
+
+
+def get_remembered_subnet_owner_uris(netuid: int) -> Tuple[Optional[str], Optional[str]]:
+    with OWNER_REGISTRY_LOCK:
+        return (
+            KNOWN_SUBNET_OWNER_COLD_URIS.get(int(netuid)),
+            KNOWN_SUBNET_OWNER_HOT_URIS.get(int(netuid)),
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -353,7 +421,7 @@ def _reconnect_substrate(substrate: SubstrateInterface):
                         raise
 
                     # Fallback: rebuild the entire object.
-                    fresh = SubstrateInterface(url=url, auto_reconnect=True)
+                    fresh = SubstrateInterface(url=url, auto_reconnect=True, type_registry=CUSTOM_TYPE_REGISTRY)
                     fresh.init_runtime()
 
                     substrate.__dict__.clear()
@@ -402,7 +470,7 @@ def connect(ws: str) -> SubstrateInterface:
     for attempt in range(1, QUERY_RETRY_ATTEMPTS + 1):
         try:
             with SUBSTRATE_IO_LOCK:
-                substrate = SubstrateInterface(url=ws, auto_reconnect=True)
+                substrate = SubstrateInterface(url=ws, auto_reconnect=True, type_registry=CUSTOM_TYPE_REGISTRY)
                 substrate.init_runtime()
                 return substrate
         except Exception as e:
@@ -434,6 +502,69 @@ def from_planck(p: int, decimals: int) -> float:
 
 def fmt_tao(p: int, decimals: int) -> str:
     return f"{from_planck(p, decimals):.9f} TAO"
+
+def _to_decimal_num(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value))
+    return Decimal(str(value).strip())
+
+
+def u64f64_from_num(value: Any) -> int:
+    scaled = (_to_decimal_num(value) * Decimal(ONE_U64F64)).to_integral_value(rounding=ROUND_FLOOR)
+    raw = int(scaled)
+    if raw < 0:
+        return 0
+    if raw > U128_MAX:
+        return U128_MAX
+    return raw
+
+
+def u64f64_to_decimal(raw: int) -> Decimal:
+    return Decimal(max(0, int(raw))) / Decimal(ONE_U64F64)
+
+
+def fmt_u64f64(raw: int, places: int = 6) -> str:
+    quant = Decimal(1).scaleb(-places)
+    return format(u64f64_to_decimal(raw).quantize(quant), "f")
+
+
+def normalized_mult_raw(mult_raw: int) -> int:
+    return max(ONE_U64F64, max(0, int(mult_raw)))
+
+
+def u64f64_ceil_to_int(raw: int) -> int:
+    raw = max(0, int(raw))
+    if raw == 0:
+        return 0
+    return (raw + ONE_U64F64 - 1) >> U64F64_FRAC_BITS
+
+
+def mul_u64_by_u64f64(value: int, mult_raw: int) -> int:
+    value = max(0, int(value))
+    mult_raw = max(0, int(mult_raw))
+    product = value * mult_raw
+    shifted = product >> U64F64_FRAC_BITS
+    return U64_MAX if shifted > U64_MAX else shifted
+
+
+def clamp_burn(value: int, min_burn: int, max_burn: int) -> int:
+    value = max(0, int(value))
+    lower = max(0, int(min_burn))
+    upper = max(lower, int(max_burn))
+    if value < lower:
+        value = lower
+    if value > upper:
+        value = upper
+    return value
+
+
+def safety_mult_from_u64f64(mult_raw: int) -> int:
+    return max(NEXT_REG_BALANCE_SAFETY_MULT, max(2, 2 * u64f64_ceil_to_int(normalized_mult_raw(mult_raw))))
+
 
 
 def as_int(v: Any) -> int:
@@ -684,6 +815,147 @@ def _extract_named_or_positional_balance(attrs: Any, target_names: Sequence[str]
     return _walk(attrs)
 
 
+def _extract_named_or_positional_value(attrs: Any, target_names: Sequence[str]) -> Any:
+    target_names_lower = {str(name).lower() for name in target_names}
+
+    def _walk(value: Any) -> Any:
+        value = getattr(value, "value", value)
+
+        if value is None:
+            return None
+
+        if isinstance(value, dict):
+            lowered = {str(k).lower(): v for k, v in value.items()}
+            for key in target_names_lower:
+                if key in lowered:
+                    return getattr(lowered[key], "value", lowered[key])
+
+            name = lowered.get("name") or lowered.get("field") or lowered.get("id")
+            if name is not None and str(name).lower() in target_names_lower and "value" in value:
+                return getattr(value["value"], "value", value["value"])
+
+            for nested in value.values():
+                found = _walk(nested)
+                if found is not None:
+                    return found
+            return None
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                found = _walk(item)
+                if found is not None:
+                    return found
+            return None
+
+        return None
+
+    return _walk(attrs)
+
+
+def _dispatch_result_error(value: Any) -> Optional[str]:
+    value = getattr(value, "value", value)
+
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        lowered = {str(k).lower(): getattr(v, "value", v) for k, v in value.items()}
+
+        if "ok" in lowered:
+            return None
+        if "err" in lowered:
+            return simplify_error_message(lowered["err"]) or "Sudo inner call failed"
+        if "error" in lowered:
+            return simplify_error_message(lowered["error"]) or "Sudo inner call failed"
+
+        for nested in value.values():
+            err = _dispatch_result_error(nested)
+            if err is not None:
+                return err
+        return None
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            err = _dispatch_result_error(item)
+            if err is not None:
+                return err
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    lower = text.lower()
+    if lower in {"ok", "none", "null", "()", "success"} or lower.startswith("ok"):
+        return None
+    if "err" in lower or "error" in lower or "failed" in lower:
+        return simplify_error_message(text) or text
+
+    return None
+
+
+def apply_sudo_result_to_receipt(substrate: SubstrateInterface, rec: Any):
+    block_hash = getattr(rec, "block_hash", None)
+    extrinsic_idx = receipt_extrinsic_index(substrate, rec)
+
+    if not block_hash or extrinsic_idx is None:
+        raise RuntimeError(
+            "Unable to resolve sudo result for finalized sudo extrinsic "
+            f"(block_hash={block_hash}, extrinsic_idx={extrinsic_idx})"
+        )
+
+    events_res = safe_query(substrate, "System", "Events", [], block_hash=block_hash)
+    events = getattr(events_res, "value", events_res) or []
+
+    sudo_result_found = False
+    last_error: Optional[str] = None
+
+    for event_record in events:
+        idx = event_extrinsic_index(event_record)
+        if idx != extrinsic_idx:
+            continue
+
+        module, name, attrs = event_identity(event_record)
+        module_key = module.lower().replace("_", "")
+        name_key = name.lower()
+
+        if module_key != "sudo":
+            continue
+        if name_key not in ("sudid", "sudoasdone"):
+            continue
+
+        sudo_result_found = True
+        result_value = _extract_named_or_positional_value(
+            attrs,
+            ("sudo_result", "sudoresult", "dispatch_result", "dispatchresult", "result"),
+        )
+        if result_value is None:
+            result_value = attrs
+
+        err = _dispatch_result_error(result_value)
+        if err is None:
+            try:
+                setattr(rec, "is_success", True)
+                setattr(rec, "error_message", "")
+            except Exception:
+                pass
+            return rec
+
+        last_error = err
+
+    if not sudo_result_found:
+        raise RuntimeError(
+            f"Sudo extrinsic finalized in block {block_hash}, but no Sudo result event was found"
+        )
+
+    try:
+        setattr(rec, "is_success", False)
+        setattr(rec, "error_message", last_error or "Sudo inner call failed")
+    except Exception:
+        pass
+    return rec
+
+
 def receipt_extrinsic_index(substrate: SubstrateInterface, rec: Any) -> Optional[int]:
     direct_idx = getattr(rec, "extrinsic_idx", None)
     if direct_idx is not None:
@@ -919,7 +1191,17 @@ def submit(substrate: SubstrateInterface, signer: Keypair, call, sudo: bool = Fa
         call = compose_call(substrate, "Sudo", "sudo", {"call": call})
 
     xt = create_signed_extrinsic_safe(substrate, signer, call)
-    return submit_prebuilt_extrinsic(substrate, xt, allow_failed=False)
+    rec = submit_prebuilt_extrinsic(substrate, xt, allow_failed=False)
+
+    if sudo:
+        rec = apply_sudo_result_to_receipt(substrate, rec)
+        if not getattr(rec, "is_success", False):
+            raise RuntimeError(
+                f"Sudo inner call failed in block {rec.block_hash}: "
+                f"{getattr(rec, 'error_message', '') or 'unknown error'}"
+            )
+
+    return rec
 
 
 def submit_allow_failure(substrate: SubstrateInterface, signer: Keypair, call, sudo: bool = False):
@@ -927,7 +1209,12 @@ def submit_allow_failure(substrate: SubstrateInterface, signer: Keypair, call, s
         call = compose_call(substrate, "Sudo", "sudo", {"call": call})
 
     xt = create_signed_extrinsic_safe(substrate, signer, call)
-    return submit_prebuilt_extrinsic(substrate, xt, allow_failed=True)
+    rec = submit_prebuilt_extrinsic(substrate, xt, allow_failed=True)
+
+    if sudo:
+        rec = apply_sudo_result_to_receipt(substrate, rec)
+
+    return rec
 
 
 def q_int(
@@ -1071,6 +1358,143 @@ def open_network(ctx: NetworkContext):
     return substrate, sudo, reg_cold, log
 
 
+def as_ss58(v: Any) -> Optional[str]:
+    value = getattr(v, "value", v)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        return s or None
+    if isinstance(value, dict):
+        for key in ("value", "account", "account_id", "id", "Id", "address"):
+            if key in value:
+                nested = as_ss58(value[key])
+                if nested:
+                    return nested
+        for nested_value in value.values():
+            nested = as_ss58(nested_value)
+            if nested:
+                return nested
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            nested = as_ss58(item)
+            if nested:
+                return nested
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def subnet_owner_ss58_at(
+    substrate: SubstrateInterface,
+    netuid: int,
+    block_hash: Optional[str] = None,
+) -> Optional[str]:
+    try:
+        res = safe_query(substrate, PALLET_SUBTENSOR, "SubnetOwner", [netuid], block_hash=block_hash)
+        if res is None or res.value is None:
+            return None
+        owner = as_ss58(res.value)
+        if owner and owner != "0x0000000000000000000000000000000000000000000000000000000000000000":
+            return owner
+    except Exception:
+        pass
+    return None
+
+
+def subnet_owner_hot_ss58_at(
+    substrate: SubstrateInterface,
+    netuid: int,
+    block_hash: Optional[str] = None,
+) -> Optional[str]:
+    try:
+        res = safe_query(substrate, PALLET_SUBTENSOR, "SubnetOwnerHotkey", [netuid], block_hash=block_hash)
+        if res is None or res.value is None:
+            return None
+        owner = as_ss58(res.value)
+        if owner and owner != "0x0000000000000000000000000000000000000000000000000000000000000000":
+            return owner
+    except Exception:
+        pass
+    return None
+
+
+def resolve_owner_signer_candidates(
+    substrate: SubstrateInterface,
+    netuid: int,
+    block_hash: Optional[str] = None,
+    ctx: Optional[NetworkContext] = None,
+    extra_keypairs: Optional[Sequence[Tuple[str, Keypair]]] = None,
+) -> List[Tuple[str, Keypair]]:
+    owner_cold_hint = subnet_owner_ss58_at(substrate, netuid, block_hash)
+    owner_hot_hint = subnet_owner_hot_ss58_at(substrate, netuid, block_hash)
+    remembered_cold_uri, _remembered_hot_uri = get_remembered_subnet_owner_uris(netuid)
+
+    specs: List[Tuple[str, str]] = []
+
+    def add_spec(label: str, uri: Optional[str]):
+        if uri:
+            specs.append((label, uri))
+
+    if ctx is not None:
+        add_spec(f"ctx-net{netuid}-owner-cold", ctx.owner_cold_uri)
+        add_spec(f"ctx-net{netuid}-payer", ctx.payer_uri)
+
+    add_spec(f"remembered-net{netuid}-owner-cold", remembered_cold_uri)
+    add_spec(f"net{netuid}-owner-cold", f"//Alice//SubnetOwnerCold//Net{netuid}")
+    specs.extend(OWNER_DEV_FALLBACK_URIS)
+
+    raw_candidates: List[Tuple[str, Keypair]] = []
+    if extra_keypairs:
+        raw_candidates.extend(extra_keypairs)
+
+    for label, uri in specs:
+        try:
+            raw_candidates.append((label, Keypair.create_from_uri(uri)))
+        except Exception:
+            continue
+
+    deduped: List[Tuple[str, Keypair]] = []
+    seen_ss58: set[str] = set()
+    for label, keypair in raw_candidates:
+        if keypair.ss58_address in seen_ss58:
+            continue
+        seen_ss58.add(keypair.ss58_address)
+        deduped.append((label, keypair))
+
+    if owner_cold_hint:
+        matched: List[Tuple[str, Keypair]] = []
+        for label, keypair in deduped:
+            if keypair.ss58_address == owner_cold_hint:
+                matched.append((f"{label}-cold", keypair))
+        if matched:
+            deduped = matched
+        else:
+            raise RuntimeError(
+                f"Could not resolve a local subnet-owner coldkey signer for netuid={netuid}. "
+                f"on-chain owner={owner_cold_hint}, owner_hotkey={owner_hot_hint or 'unknown'}. "
+                f"Provide --owner-uris if needed."
+            )
+        deduped.sort(key=lambda item: (item[1].ss58_address != owner_cold_hint, item[0]))
+
+    return deduped
+
+
+def format_owner_signer(label: str, signer: Keypair) -> str:
+    return f"{label}/{short_ss58(signer.ss58_address)}"
+
+
+def log_owner_signer_candidates(log: Callable[[str], None], owner_signers: Sequence[Tuple[str, Keypair]]):
+    if owner_signers:
+        log(
+            "🔑 Burn-config signer candidates: "
+            + ", ".join(format_owner_signer(label, signer) for label, signer in owner_signers)
+        )
+    else:
+        log("🔑 Burn-config signer candidates: none resolved")
+
+
 # ─────────────────────────────────────────────────────────────
 # Chain queries
 # ─────────────────────────────────────────────────────────────
@@ -1089,25 +1513,19 @@ def burn_at_strict(substrate: SubstrateInterface, netuid: int, block_hash: str) 
     raise RuntimeError(f"Could not read burn for netuid={netuid} at block_hash={block_hash}")
 
 
-def min_burn_at(substrate: SubstrateInterface, netuid: int, block_hash: str) -> int:
-    v = q_int(substrate, PALLET_SUBTENSOR, "MinBurn", [netuid], block_hash)
-    if v != 0:
-        return v
-    return q_int(substrate, PALLET_SUBTENSOR, "MinBurn", [], block_hash)
+def min_burn_at_strict(substrate: SubstrateInterface, netuid: int, block_hash: str) -> int:
+    return q_int_strict(substrate, PALLET_SUBTENSOR, "MinBurn", [netuid], block_hash)
 
 
-def max_burn_at(substrate: SubstrateInterface, netuid: int, block_hash: str) -> int:
-    v = q_int(substrate, PALLET_SUBTENSOR, "MaxBurn", [netuid], block_hash)
-    if v != 0:
-        return v
-    return q_int(substrate, PALLET_SUBTENSOR, "MaxBurn", [], block_hash)
+def max_burn_at_strict(substrate: SubstrateInterface, netuid: int, block_hash: str) -> int:
+    return q_int_strict(substrate, PALLET_SUBTENSOR, "MaxBurn", [netuid], block_hash)
 
 
 def burn_half_life_at_strict(substrate: SubstrateInterface, netuid: int, block_hash: str) -> int:
     return q_int_strict(substrate, PALLET_SUBTENSOR, "BurnHalfLife", [netuid], block_hash)
 
 
-def burn_increase_mult_at_strict(substrate: SubstrateInterface, netuid: int, block_hash: str) -> int:
+def burn_increase_mult_raw_at_strict(substrate: SubstrateInterface, netuid: int, block_hash: str) -> int:
     return q_int_strict(substrate, PALLET_SUBTENSOR, "BurnIncreaseMult", [netuid], block_hash)
 
 
@@ -1197,6 +1615,26 @@ def sudo_set_network_rate_limit(substrate: SubstrateInterface, sudo: Keypair, ra
                 continue
 
 
+def sudo_set_owner_hparam_rate_limit(substrate: SubstrateInterface, sudo: Keypair, epochs: int):
+    candidates = [
+        (PALLET_ADMIN, "sudo_set_owner_hparam_rate_limit", {"epochs": int(epochs)}),
+        (PALLET_SUBTENSOR, "sudo_set_owner_hparam_rate_limit", {"epochs": int(epochs)}),
+        (PALLET_ADMIN, "sudo_set_owner_hparam_rate_limit", {"owner_hparam_rate_limit": int(epochs)}),
+        (PALLET_SUBTENSOR, "sudo_set_owner_hparam_rate_limit", {"owner_hparam_rate_limit": int(epochs)}),
+    ]
+    last = None
+    with ALICE_LOCK:
+        for pallet, fn, params in candidates:
+            try:
+                call = compose_call(substrate, pallet, fn, params)
+                submit(substrate, sudo, call, sudo=True)
+                return
+            except Exception as e:
+                last = e
+    if last is not None:
+        raise RuntimeError(f"Failed to set OwnerHyperparamRateLimit via any known pallet: {last}")
+
+
 def sudo_set_registration_allowed(substrate: SubstrateInterface, sudo: Keypair, netuid: int, allowed: bool):
     candidates = [
         (PALLET_ADMIN, "sudo_set_network_registration_allowed", {"netuid": netuid, "registration_allowed": bool(allowed)}),
@@ -1217,38 +1655,137 @@ def sudo_set_registration_allowed(substrate: SubstrateInterface, sudo: Keypair, 
         raise last
 
 
-def sudo_set_burn_half_life(substrate: SubstrateInterface, sudo: Keypair, netuid: int, burn_half_life: int):
-    candidates = [
-        (PALLET_ADMIN, "sudo_set_burn_half_life"),
-        (PALLET_SUBTENSOR, "sudo_set_burn_half_life"),
-    ]
-    last = None
-    with ALICE_LOCK:
-        for pallet, fn in candidates:
+def _owner_signed_verified_set(
+    substrate: SubstrateInterface,
+    owner_signers: Sequence[Tuple[str, Keypair]],
+    netuid: int,
+    call_candidates: Sequence[Tuple[str, str, Dict[str, Any]]],
+    verify_reader: Callable[[SubstrateInterface, int, str], int],
+    expected_value: int,
+    value_name: str,
+    value_formatter: Callable[[int], str] = str,
+):
+    if not owner_signers:
+        raise RuntimeError(f"No subnet-owner signer candidates available for netuid={netuid}")
+
+    attempts: List[str] = []
+    last_exc: Optional[Exception] = None
+
+    for label, signer in owner_signers:
+        signer_desc = format_owner_signer(label, signer)
+        for pallet, fn, params in call_candidates:
             try:
-                call = compose_call(substrate, pallet, fn, {"netuid": int(netuid), "burn_half_life": int(burn_half_life)})
-                submit(substrate, sudo, call, sudo=True)
-                return
+                with OWNER_CONFIG_LOCK:
+                    call = compose_call(substrate, pallet, fn, params)
+                    rec = submit(substrate, signer, call, sudo=False)
+                actual = verify_reader(substrate, netuid, rec.block_hash)
+                if actual == expected_value:
+                    return rec
+
+                msg = (
+                    f"{pallet}.{fn} by {signer_desc} finalized but {value_name} remained "
+                    f"{value_formatter(actual)} instead of {value_formatter(expected_value)} on netuid={netuid}"
+                )
+                attempts.append(msg)
+                last_exc = RuntimeError(msg)
             except Exception as e:
-                last = e
-    raise RuntimeError(f"Failed to set BurnHalfLife via any known pallet: {last}")
+                err = simplify_error_message(str(e)) or str(e)
+                attempts.append(f"{pallet}.{fn} by {signer_desc} failed: {err}")
+                last_exc = e
+
+    joined = "\n  - ".join(attempts[-12:])
+    raise RuntimeError(
+        f"Failed to set {value_name} via subnet-owner signer candidates on netuid={netuid}:\n  - {joined}"
+    ) from last_exc
 
 
-def sudo_set_burn_increase_mult(substrate: SubstrateInterface, sudo: Keypair, netuid: int, burn_increase_mult: int):
-    candidates = [
-        (PALLET_ADMIN, "sudo_set_burn_increase_mult"),
-        (PALLET_SUBTENSOR, "sudo_set_burn_increase_mult"),
+def owner_set_burn_half_life(
+    substrate: SubstrateInterface,
+    owner_signers: Sequence[Tuple[str, Keypair]],
+    netuid: int,
+    burn_half_life: int,
+):
+    expected = int(burn_half_life)
+    call_candidates = [
+        (PALLET_ADMIN, "sudo_set_burn_half_life", {"netuid": int(netuid), "burn_half_life": expected}),
+        (PALLET_SUBTENSOR, "sudo_set_burn_half_life", {"netuid": int(netuid), "burn_half_life": expected}),
     ]
-    last = None
-    with ALICE_LOCK:
-        for pallet, fn in candidates:
-            try:
-                call = compose_call(substrate, pallet, fn, {"netuid": int(netuid), "burn_increase_mult": int(burn_increase_mult)})
-                submit(substrate, sudo, call, sudo=True)
-                return
-            except Exception as e:
-                last = e
-    raise RuntimeError(f"Failed to set BurnIncreaseMult via any known pallet: {last}")
+    return _owner_signed_verified_set(
+        substrate=substrate,
+        owner_signers=owner_signers,
+        netuid=netuid,
+        call_candidates=call_candidates,
+        verify_reader=burn_half_life_at_strict,
+        expected_value=expected,
+        value_name="BurnHalfLife",
+    )
+
+
+def owner_set_burn_increase_mult(
+    substrate: SubstrateInterface,
+    owner_signers: Sequence[Tuple[str, Keypair]],
+    netuid: int,
+    burn_increase_mult_num: Any,
+):
+    expected_raw = u64f64_from_num(burn_increase_mult_num)
+    call_candidates = [
+        (PALLET_ADMIN, "sudo_set_burn_increase_mult", {"netuid": int(netuid), "burn_increase_mult": expected_raw}),
+        (PALLET_SUBTENSOR, "sudo_set_burn_increase_mult", {"netuid": int(netuid), "burn_increase_mult": expected_raw}),
+    ]
+    return _owner_signed_verified_set(
+        substrate=substrate,
+        owner_signers=owner_signers,
+        netuid=netuid,
+        call_candidates=call_candidates,
+        verify_reader=burn_increase_mult_raw_at_strict,
+        expected_value=expected_raw,
+        value_name="BurnIncreaseMult",
+        value_formatter=fmt_u64f64,
+    )
+
+
+def owner_set_min_burn(
+    substrate: SubstrateInterface,
+    owner_signers: Sequence[Tuple[str, Keypair]],
+    netuid: int,
+    min_burn: int,
+):
+    expected = int(min_burn)
+    call_candidates = [
+        (PALLET_ADMIN, "sudo_set_min_burn", {"netuid": int(netuid), "min_burn": expected}),
+        (PALLET_SUBTENSOR, "sudo_set_min_burn", {"netuid": int(netuid), "min_burn": expected}),
+    ]
+    return _owner_signed_verified_set(
+        substrate=substrate,
+        owner_signers=owner_signers,
+        netuid=netuid,
+        call_candidates=call_candidates,
+        verify_reader=min_burn_at_strict,
+        expected_value=expected,
+        value_name="MinBurn",
+    )
+
+
+def owner_set_max_burn(
+    substrate: SubstrateInterface,
+    owner_signers: Sequence[Tuple[str, Keypair]],
+    netuid: int,
+    max_burn: int,
+):
+    expected = int(max_burn)
+    call_candidates = [
+        (PALLET_ADMIN, "sudo_set_max_burn", {"netuid": int(netuid), "max_burn": expected}),
+        (PALLET_SUBTENSOR, "sudo_set_max_burn", {"netuid": int(netuid), "max_burn": expected}),
+    ]
+    return _owner_signed_verified_set(
+        substrate=substrate,
+        owner_signers=owner_signers,
+        netuid=netuid,
+        call_candidates=call_candidates,
+        verify_reader=max_burn_at_strict,
+        expected_value=expected,
+        value_name="MaxBurn",
+    )
 
 
 def sudo_set_subnet_limit(substrate: SubstrateInterface, sudo: Keypair, max_subnets: int):
@@ -1503,6 +2040,21 @@ def batch_sudo_as_burned_registers_with_retry(
     )
 
 
+def is_register_network_param_error(exc: Exception) -> bool:
+    text = simplify_error_message(str(exc)).lower()
+    markers = [
+        "parameter '",
+        'parameter "',
+        "not specified",
+        "unknown parameter",
+        "unexpected parameter",
+        "unexpected keyword",
+        "missing required",
+        "missing value",
+    ]
+    return any(marker in text for marker in markers)
+
+
 def register_network(
     substrate: SubstrateInterface,
     signer: Keypair,
@@ -1510,18 +2062,33 @@ def register_network(
     owner_cold_ss58: str,
 ):
     candidates = [
-        {"owner_hotkey": owner_hot_ss58, "owner_coldkey": owner_cold_ss58},
+        {"hotkey": owner_hot_ss58},
         {"hotkey": owner_hot_ss58, "coldkey": owner_cold_ss58},
+        {"hotkey": owner_hot_ss58, "owner_coldkey": owner_cold_ss58},
+        {"owner_hotkey": owner_hot_ss58, "owner_coldkey": owner_cold_ss58},
         {"owner_hot": owner_hot_ss58, "owner_cold": owner_cold_ss58},
     ]
-    last = None
+
+    shape_errors: List[str] = []
     for params in candidates:
         try:
             call = compose_call(substrate, PALLET_SUBTENSOR, "register_network", params)
+        except Exception as e:
+            if is_register_network_param_error(e):
+                shape_errors.append(f"keys={sorted(params.keys())}: {simplify_error_message(str(e))}")
+                continue
+            raise
+
+        try:
             return submit(substrate, signer, call, sudo=False)
         except Exception as e:
-            last = e
-    raise RuntimeError(f"register_network failed with all candidates: {last}")
+            raise RuntimeError(
+                "register_network submission failed for parameter shape "
+                f"{sorted(params.keys())}: {simplify_error_message(str(e)) or str(e)}"
+            ) from e
+
+    joined = " | ".join(shape_errors) if shape_errors else "no candidate parameter shape composed successfully"
+    raise RuntimeError(f"register_network could not match any known parameter shape: {joined}")
 
 
 def register_network_with_retry(
@@ -1557,42 +2124,64 @@ def allocate_scratch_subnet_for_stage(
     decimals: int,
     seed_tag: str,
     log: Callable[[str], None],
-) -> int:
-    before = set(networks_added(substrate))
+) -> Tuple[int, List[Tuple[str, Keypair]]]:
+    with NETWORK_CREATION_LOCK:
+        before = set(networks_added(substrate))
 
-    try:
-        desired_limit = max((max(before) if before else 0) + 8, len(before) + 8)
-        sudo_set_subnet_limit(substrate, sudo, desired_limit)
-    except Exception as e:
-        log(f"ℹ️  Scratch subnet allocation could not raise subnet limit automatically: {simplify_error_message(str(e))}")
+        try:
+            sudo_set_owner_hparam_rate_limit(substrate, sudo, 0)
+        except Exception:
+            pass
 
-    owner_cold = Keypair.create_from_uri(f"//Alice//DynBurnScratchCold//{seed_tag}")
-    owner_hot = Keypair.create_from_uri(f"//Alice//DynBurnScratchHot//{seed_tag}")
+        try:
+            desired_limit = max((max(before) if before else 0) + 8, len(before) + 8)
+            sudo_set_subnet_limit(substrate, sudo, desired_limit)
+        except Exception as e:
+            log(f"ℹ️  Scratch subnet allocation could not raise subnet limit automatically: {simplify_error_message(str(e))}")
 
-    ensure_min_balance(substrate, sudo, owner_cold, REGISTER_NETWORK_MIN_OWNER_COLD_TAO, decimals)
-    ensure_min_balance(substrate, sudo, owner_hot, REGISTER_NETWORK_MIN_OWNER_HOT_TAO, decimals)
+        owner_cold = Keypair.create_from_uri(f"//Alice//DynBurnScratchCold//{seed_tag}")
+        owner_hot = Keypair.create_from_uri(f"//Alice//DynBurnScratchHot//{seed_tag}")
 
-    register_network_with_retry(
-        substrate=substrate,
-        signer=owner_cold,
-        owner_hot_ss58=owner_hot.ss58_address,
-        owner_cold_ss58=owner_cold.ss58_address,
-    )
+        ensure_min_balance(substrate, sudo, owner_cold, REGISTER_NETWORK_MIN_OWNER_COLD_TAO, decimals)
+        ensure_min_balance(substrate, sudo, owner_hot, REGISTER_NETWORK_MIN_OWNER_HOT_TAO, decimals)
 
-    after = set(networks_added(substrate))
-    created = sorted(n for n in after if n not in before and n != 0)
-    if not created:
-        raise RuntimeError(f"Scratch subnet allocation did not create a visible subnet for seed={seed_tag}")
+        register_network_with_retry(
+            substrate=substrate,
+            signer=owner_cold,
+            owner_hot_ss58=owner_hot.ss58_address,
+            owner_cold_ss58=owner_cold.ss58_address,
+        )
 
-    scratch_netuid = created[-1]
+        after = set(networks_added(substrate))
+        created = sorted(n for n in after if n not in before and n != 0)
+        if not created:
+            raise RuntimeError(f"Scratch subnet allocation did not create a visible subnet for seed={seed_tag}")
 
-    probe_rec = produce_one_block(substrate, owner_cold, f"scratch-probe-{seed_tag}-{scratch_netuid}")
-    if not registration_allowed_at(substrate, scratch_netuid, probe_rec.block_hash):
-        sudo_set_registration_allowed(substrate, sudo, scratch_netuid, True)
-        produce_one_block(substrate, owner_cold, f"scratch-enable-{seed_tag}-{scratch_netuid}")
+        scratch_netuid = created[-1]
 
-    log(f"🧪 Using scratch subnet {scratch_netuid} for this burn-config stage.")
-    return scratch_netuid
+        probe_rec = produce_one_block(substrate, owner_cold, f"scratch-probe-{seed_tag}-{scratch_netuid}")
+        if not registration_allowed_at(substrate, scratch_netuid, probe_rec.block_hash):
+            sudo_set_registration_allowed(substrate, sudo, scratch_netuid, True)
+            produce_one_block(substrate, owner_cold, f"scratch-enable-{seed_tag}-{scratch_netuid}")
+
+        remember_subnet_owner_uris(
+            scratch_netuid,
+            cold_uri=f"//Alice//DynBurnScratchCold//{seed_tag}",
+            hot_uri=f"//Alice//DynBurnScratchHot//{seed_tag}",
+        )
+
+        owner_signers = resolve_owner_signer_candidates(
+            substrate=substrate,
+            netuid=scratch_netuid,
+            block_hash=probe_rec.block_hash,
+            extra_keypairs=[
+                (f"scratch-{seed_tag}-owner-cold", owner_cold),
+                (f"scratch-{seed_tag}-owner-hot", owner_hot),
+            ],
+        )
+
+        log(f"🧪 Using scratch subnet {scratch_netuid} for this burn-config stage.")
+        return scratch_netuid, owner_signers
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1669,6 +2258,8 @@ def simulate_one_on_initialize_step(
     burn_before: int,
     entering_block: int,
     burn_half_life: int,
+    min_burn: int,
+    max_burn: int,
 ) -> int:
     burn = max(0, int(burn_before))
     current_block = max(0, int(entering_block))
@@ -1676,46 +2267,49 @@ def simulate_one_on_initialize_step(
     if burn_half_life > 0 and current_block > 1:
         factor_q32 = decay_factor_q32(burn_half_life)
         burn = mul_by_q32(burn, factor_q32)
-        if burn == 0:
-            burn = 1
 
-    return burn
+    return clamp_burn(burn, min_burn, max_burn)
 
 
 def build_same_block_charge_sequence(
     entry_burn: int,
-    burn_increase_mult: int,
+    burn_increase_mult_raw: int,
     reg_count: int,
+    min_burn: int,
+    max_burn: int,
 ) -> Tuple[List[int], int]:
-    burn = max(0, int(entry_burn))
-    mult = max(1, int(burn_increase_mult))
+    burn = clamp_burn(entry_burn, min_burn, max_burn)
+    mult_raw = normalized_mult_raw(burn_increase_mult_raw)
     count = max(0, int(reg_count))
 
     charges: List[int] = []
     for _ in range(count):
         charges.append(burn)
-        burn = sat_mul_u64(burn, mult)
-        if burn == 0:
-            burn = 1
+        burn = clamp_burn(
+            mul_u64_by_u64f64(burn, mult_raw),
+            min_burn,
+            max_burn,
+        )
 
     return charges, burn
 
 
 def simulate_registration_bumps_for_block(
     burn_before: int,
-    burn_increase_mult: int,
+    burn_increase_mult_raw: int,
     regs_this_block: int,
+    min_burn: int,
+    max_burn: int,
 ) -> int:
-    burn = max(0, int(burn_before))
-
-    if regs_this_block > 0:
-        mult = max(1, int(burn_increase_mult))
-        bump = sat_pow_u64(mult, int(regs_this_block))
-        burn = sat_mul_u64(burn, bump)
-        if burn == 0:
-            burn = 1
-
-    return burn
+    burn = clamp_burn(burn_before, min_burn, max_burn)
+    _, final_burn = build_same_block_charge_sequence(
+        entry_burn=burn,
+        burn_increase_mult_raw=burn_increase_mult_raw,
+        reg_count=regs_this_block,
+        min_burn=min_burn,
+        max_burn=max_burn,
+    )
+    return final_burn
 
 
 def simulate_from_block_state(
@@ -1723,10 +2317,12 @@ def simulate_from_block_state(
     start_block: int,
     end_block: int,
     burn_half_life: int,
-    burn_increase_mult: int,
+    burn_increase_mult_raw: int,
+    min_burn: int,
+    max_burn: int,
     regs_this_block_map: Dict[int, int],
 ) -> int:
-    burn = int(start_burn)
+    burn = clamp_burn(start_burn, min_burn, max_burn)
     if end_block <= start_block:
         return burn
 
@@ -1735,12 +2331,16 @@ def simulate_from_block_state(
             burn_before=burn,
             entering_block=block_number,
             burn_half_life=burn_half_life,
+            min_burn=min_burn,
+            max_burn=max_burn,
         )
         regs_this_block = int(regs_this_block_map.get(block_number, 0))
         burn = simulate_registration_bumps_for_block(
             burn_before=burn,
-            burn_increase_mult=burn_increase_mult,
+            burn_increase_mult_raw=burn_increase_mult_raw,
             regs_this_block=regs_this_block,
+            min_burn=min_burn,
+            max_burn=max_burn,
         )
     return burn
 
@@ -1766,7 +2366,9 @@ def assert_sampled_transition(
     prev_state: Dict[str, int],
     cur_state: Dict[str, int],
     burn_half_life: int,
-    burn_increase_mult: int,
+    burn_increase_mult_raw: int,
+    min_burn: int,
+    max_burn: int,
     regs_map: Dict[int, int],
     decimals: int,
     phase: str,
@@ -1777,7 +2379,9 @@ def assert_sampled_transition(
         start_block=prev_state["block"],
         end_block=cur_state["block"],
         burn_half_life=burn_half_life,
-        burn_increase_mult=burn_increase_mult,
+        burn_increase_mult_raw=burn_increase_mult_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         regs_this_block_map=regs_map,
     )
 
@@ -1805,7 +2409,9 @@ def sample_decay_for_n_blocks(
     decimals: int,
     start_state: Dict[str, int],
     burn_half_life: int,
-    burn_increase_mult: int,
+    burn_increase_mult_raw: int,
+    min_burn: int,
+    max_burn: int,
     num_steps: int,
     tag_prefix: str,
     print_prefix: str,
@@ -1822,7 +2428,9 @@ def sample_decay_for_n_blocks(
             prev_state=prev_state,
             cur_state=cur_state,
             burn_half_life=burn_half_life,
-            burn_increase_mult=burn_increase_mult,
+            burn_increase_mult_raw=burn_increase_mult_raw,
+            min_burn=min_burn,
+            max_burn=max_burn,
             regs_map=regs_map,
             decimals=decimals,
             phase=f"{print_prefix} sampled decay step #{step}",
@@ -1873,7 +2481,9 @@ def run_many_registrations_default_params(ctx: NetworkContext):
     sync_state = read_net_state(substrate, ctx.netuid, sync_hash)
 
     default_hl = burn_half_life_at_strict(substrate, ctx.netuid, sync_hash)
-    default_mult = burn_increase_mult_at_strict(substrate, ctx.netuid, sync_hash)
+    default_mult_raw = burn_increase_mult_raw_at_strict(substrate, ctx.netuid, sync_hash)
+    default_min_burn = min_burn_at_strict(substrate, ctx.netuid, sync_hash)
+    default_max_burn = max_burn_at_strict(substrate, ctx.netuid, sync_hash)
     default_burn = sync_state["burn"]
     default_regs = sync_state["regs"]
     default_n = sync_state["n"]
@@ -1890,9 +2500,10 @@ def run_many_registrations_default_params(ctx: NetworkContext):
 
     scenario_banner(
         log,
-        f"🚀 Default stress scenario | BurnHalfLife={default_hl} | BurnIncreaseMult={default_mult}",
-        f"decay factor ≈ {factor_float:.12f} | "
-        f"target regs = {STRESS_TARGET_TOTAL_REGS} | max allowed uids = {max_allowed} | "
+        f"🚀 Default stress scenario | BurnHalfLife={default_hl} | BurnIncreaseMult={fmt_u64f64(default_mult_raw)}",
+        f"decay factor ≈ {factor_float:.12f} | target regs = {STRESS_TARGET_TOTAL_REGS} | "
+        f"max allowed uids = {max_allowed} | min burn = {fmt_tao(default_min_burn, ctx.decimals)} | "
+        f"max burn = {fmt_tao(default_max_burn, ctx.decimals)} | "
         f"soft burn cap = {STRESS_SOFT_MAX_BURN_TAO:.3f} TAO",
     )
     log(format_state("base", sync_state["block"], default_burn, default_regs, ctx.decimals, default_n, icon="🧪"))
@@ -1915,7 +2526,7 @@ def run_many_registrations_default_params(ctx: NetworkContext):
     prev_burn = prep_state["burn"]
     regs_map: Dict[int, int] = {prep_state["block"]: prep_state["regs"]}
     stress_hotkeys: List[str] = []
-    safety_mult = max(NEXT_REG_BALANCE_SAFETY_MULT, default_mult * 2)
+    safety_mult = safety_mult_from_u64f64(default_mult_raw)
     stop_reason: Optional[str] = None
 
     for i in range(total_regs):
@@ -1963,7 +2574,9 @@ def run_many_registrations_default_params(ctx: NetworkContext):
                 start_block=prev_block,
                 end_block=reg_block,
                 burn_half_life=default_hl,
-                burn_increase_mult=default_mult,
+                burn_increase_mult_raw=default_mult_raw,
+                min_burn=default_min_burn,
+                max_burn=default_max_burn,
                 regs_this_block_map=exp_regs_map,
             )
             assert_state(
@@ -2039,7 +2652,9 @@ def run_many_registrations_default_params(ctx: NetworkContext):
         start_block=prev_block,
         end_block=post_state["block"],
         burn_half_life=default_hl,
-        burn_increase_mult=default_mult,
+        burn_increase_mult_raw=default_mult_raw,
+        min_burn=default_min_burn,
+        max_burn=default_max_burn,
         regs_this_block_map=regs_map,
     )
 
@@ -2078,7 +2693,9 @@ def run_many_registrations_default_params(ctx: NetworkContext):
         decimals=ctx.decimals,
         start_state=post_state,
         burn_half_life=default_hl,
-        burn_increase_mult=default_mult,
+        burn_increase_mult_raw=default_mult_raw,
+        min_burn=default_min_burn,
+        max_burn=default_max_burn,
         num_steps=decay_steps,
         tag_prefix=f"stress-decay-{ctx.run_nonce}",
         print_prefix="sd",
@@ -2086,7 +2703,6 @@ def run_many_registrations_default_params(ctx: NetworkContext):
     )
 
     log("✅ Default stress scenario passed.")
-
 
 # ─────────────────────────────────────────────────────────────
 # Scenario: default-parameter limit-price
@@ -2098,14 +2714,17 @@ def run_register_limit_scenario(ctx: NetworkContext):
     sync_state = read_net_state(substrate, ctx.netuid, sync_rec.block_hash)
 
     half_life = burn_half_life_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
-    increase_mult = burn_increase_mult_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
+    increase_mult_raw = burn_increase_mult_raw_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
+    min_burn = min_burn_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
+    max_burn = max_burn_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
     factor_q32 = decay_factor_q32(half_life)
     factor_float = factor_q32 / float(ONE_Q32)
 
     scenario_banner(
         log,
-        f"🛡️  Limit-price scenario | BurnHalfLife={half_life} | BurnIncreaseMult={increase_mult}",
-        f"decay factor ≈ {factor_float:.12f}",
+        f"🛡️  Limit-price scenario | BurnHalfLife={half_life} | BurnIncreaseMult={fmt_u64f64(increase_mult_raw)}",
+        f"decay factor ≈ {factor_float:.12f} | min burn = {fmt_tao(min_burn, ctx.decimals)} | "
+        f"max burn = {fmt_tao(max_burn, ctx.decimals)}",
     )
     log(format_state("sync", sync_state["block"], sync_state["burn"], sync_state["regs"], ctx.decimals, sync_state["n"], icon="🔎"))
 
@@ -2121,7 +2740,7 @@ def run_register_limit_scenario(ctx: NetworkContext):
         who=reg_cold,
         reference_burn_planck=sync_state["burn"],
         decimals=ctx.decimals,
-        safety_mult=max(NEXT_REG_BALANCE_SAFETY_MULT, increase_mult * 2),
+        safety_mult=safety_mult_from_u64f64(increase_mult_raw),
         buffer_tao=NEXT_REG_BALANCE_BUFFER_TAO,
     )
 
@@ -2145,7 +2764,9 @@ def run_register_limit_scenario(ctx: NetworkContext):
         start_block=sync_state["block"],
         end_block=fail_state["block"],
         burn_half_life=half_life,
-        burn_increase_mult=increase_mult,
+        burn_increase_mult_raw=increase_mult_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         regs_this_block_map={},
     )
 
@@ -2194,7 +2815,7 @@ def run_register_limit_scenario(ctx: NetworkContext):
         who=reg_cold,
         reference_burn_planck=success_limit,
         decimals=ctx.decimals,
-        safety_mult=max(NEXT_REG_BALANCE_SAFETY_MULT, increase_mult * 2),
+        safety_mult=safety_mult_from_u64f64(increase_mult_raw),
         buffer_tao=NEXT_REG_BALANCE_BUFFER_TAO,
     )
 
@@ -2214,7 +2835,9 @@ def run_register_limit_scenario(ctx: NetworkContext):
             start_block=fail_state["block"],
             end_block=ok_state["block"],
             burn_half_life=half_life,
-            burn_increase_mult=increase_mult,
+            burn_increase_mult_raw=increase_mult_raw,
+            min_burn=min_burn,
+            max_burn=max_burn,
             regs_this_block_map={ok_state["block"]: ok_state["regs"]},
         )
         assert_state(
@@ -2234,7 +2857,9 @@ def run_register_limit_scenario(ctx: NetworkContext):
         start_block=fail_state["block"],
         end_block=ok_state["block"],
         burn_half_life=half_life,
-        burn_increase_mult=increase_mult,
+        burn_increase_mult_raw=increase_mult_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         regs_this_block_map={},
     )
 
@@ -2275,7 +2900,9 @@ def run_register_limit_scenario(ctx: NetworkContext):
         start_block=ok_state["block"],
         end_block=post_state["block"],
         burn_half_life=half_life,
-        burn_increase_mult=increase_mult,
+        burn_increase_mult_raw=increase_mult_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         regs_this_block_map={},
     )
 
@@ -2306,14 +2933,17 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
     sync_state = read_net_state(substrate, ctx.netuid, sync_rec.block_hash)
 
     half_life = burn_half_life_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
-    increase_mult = burn_increase_mult_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
+    increase_mult_raw = burn_increase_mult_raw_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
+    min_burn = min_burn_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
+    max_burn = max_burn_at_strict(substrate, ctx.netuid, sync_rec.block_hash)
     factor_q32 = decay_factor_q32(half_life)
     factor_float = factor_q32 / float(ONE_Q32)
 
     scenario_banner(
         log,
-        f"🧩 Same-block multi-registration | BurnHalfLife={half_life} | BurnIncreaseMult={increase_mult}",
-        f"decay factor ≈ {factor_float:.12f} | batched registrations in one block = {SAME_BLOCK_MULTI_REG_COUNT}",
+        f"🧩 Same-block multi-registration | BurnHalfLife={half_life} | BurnIncreaseMult={fmt_u64f64(increase_mult_raw)}",
+        f"decay factor ≈ {factor_float:.12f} | batched registrations in one block = {SAME_BLOCK_MULTI_REG_COUNT} | "
+        f"min burn = {fmt_tao(min_burn, ctx.decimals)} | max burn = {fmt_tao(max_burn, ctx.decimals)}",
     )
     log(format_state("sync", sync_state["block"], sync_state["burn"], sync_state["regs"], ctx.decimals, sync_state["n"], icon="🔎"))
 
@@ -2325,17 +2955,21 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
     batch_count = SAME_BLOCK_MULTI_REG_COUNT
 
     # Phase A: one coldkey submits a large Utility batch on a single subnet.
-    funding_reference_burn = sat_mul_u64(
-        sync_state["burn"],
-        sat_pow_u64(max(1, increase_mult), batch_count),
+    funding_reference_burn = simulate_registration_bumps_for_block(
+        burn_before=sync_state["burn"],
+        burn_increase_mult_raw=increase_mult_raw,
+        regs_this_block=batch_count,
+        min_burn=min_burn,
+        max_burn=max_burn,
     )
+    mult_safety = max(2, 2 * u64f64_ceil_to_int(normalized_mult_raw(increase_mult_raw)))
     ensure_balance_for_next_registration(
         substrate=substrate,
         funder=sudo,
         who=reg_cold,
         reference_burn_planck=funding_reference_burn,
         decimals=ctx.decimals,
-        safety_mult=max(NEXT_REG_BALANCE_SAFETY_MULT, batch_count * max(2, increase_mult * 2)),
+        safety_mult=max(NEXT_REG_BALANCE_SAFETY_MULT, batch_count * mult_safety),
         buffer_tao=NEXT_REG_BALANCE_BUFFER_TAO,
     )
 
@@ -2364,13 +2998,17 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
         start_block=same_cold_sync_state["block"],
         end_block=batch_state["block"],
         burn_half_life=half_life,
-        burn_increase_mult=increase_mult,
+        burn_increase_mult_raw=increase_mult_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         regs_this_block_map={},
     )
     expected_batch_charges, expected_batch_final_burn = build_same_block_charge_sequence(
         entry_burn=entry_burn_batch,
-        burn_increase_mult=increase_mult,
+        burn_increase_mult_raw=increase_mult_raw,
         reg_count=batch_count,
+        min_burn=min_burn,
+        max_burn=max_burn,
     )
 
     log(format_state("batch", batch_state["block"], batch_state["burn"], batch_state["regs"], ctx.decimals, batch_state["n"], icon="🧱"))
@@ -2415,8 +3053,6 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
         outer_batch_fee = transaction_fee_paid_for_receipt(substrate, batch_rec)
         fee_source = "TransactionPayment.TransactionFeePaid"
         if outer_batch_fee is None:
-            # Fallback: the same-cold payer is the outer `utility.batch` sender, so any
-            # residual above the exact burn-path sum is the batch submission fee.
             outer_batch_fee = max(0, actual_same_cold_delta - expected_same_cold_burn_delta)
             fee_source = "residual fallback"
 
@@ -2460,7 +3096,9 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
         start_block=batch_state["block"],
         end_block=batch_post_state["block"],
         burn_half_life=half_life,
-        burn_increase_mult=increase_mult,
+        burn_increase_mult_raw=increase_mult_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         regs_this_block_map={},
     )
 
@@ -2487,40 +3125,11 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
 
     log(format_state("decay-a", batch_post_state["block"], batch_post_state["burn"], batch_post_state["regs"], ctx.decimals, batch_post_state["n"], icon="📉"))
 
-    # Cool the subnet back down before the distinct-cold phase so that the
-    # funding required for the exact per-registration assertions remains practical.
-    cooldown_target_burn = max(sync_state["burn"], min_burn_at(substrate, ctx.netuid, batch_post_state["hash"]))
-    cooldown_state = batch_post_state
-    cooldown_blocks = 0
-    if cooldown_state["burn"] > cooldown_target_burn:
-        sudo_set_burn_half_life(substrate, sudo, ctx.netuid, 1)
-        while cooldown_state["burn"] > cooldown_target_burn and cooldown_blocks < 64:
-            cooldown_rec = produce_one_block(substrate, reg_cold, f"same-block-cooldown-{ctx.run_nonce}-{cooldown_blocks}")
-            cooldown_state = read_net_state(substrate, ctx.netuid, cooldown_rec.block_hash)
-            cooldown_blocks += 1
+    log(
+        f"🧊 Distinct-cold phase uses the live post-batch burn without temporary owner hyperparameter changes | "
+        f"current = {fmt_tao(batch_post_state['burn'], ctx.decimals)}"
+    )
 
-        sudo_set_burn_half_life(substrate, sudo, ctx.netuid, half_life)
-
-        if cooldown_state["burn"] > cooldown_target_burn:
-            raise AssertionError(
-                "[assert] cooldown before distinct-cold same-block batch should reduce burn to a practical level\n"
-                f"  target burn <= {fmt_tao(cooldown_target_burn, ctx.decimals)}\n"
-                f"  actual burn   = {fmt_tao(cooldown_state['burn'], ctx.decimals)}\n"
-                f"  cooldown blocks attempted = {cooldown_blocks}\n"
-            )
-
-        log(
-            f"🧊 Cooldown before distinct-cold batch: {cooldown_blocks} block(s) | "
-            f"target <= {fmt_tao(cooldown_target_burn, ctx.decimals)} | "
-            f"current = {fmt_tao(cooldown_state['burn'], ctx.decimals)}"
-        )
-    else:
-        log(
-            f"🧊 Cooldown before distinct-cold batch not needed | "
-            f"current = {fmt_tao(cooldown_state['burn'], ctx.decimals)}"
-        )
-
-    # Phase B: a second same-block burst, but each registration is charged to a distinct coldkey.
     diff_accounts: List[Tuple[Keypair, str]] = []
     for i in range(batch_count):
         cold = Keypair.create_from_uri(f"//Alice//DynBurnSameBlockDistinctCold//{ctx.netuid}//{ctx.run_nonce}//{i}")
@@ -2530,10 +3139,14 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
     distinct_prep_rec = produce_one_block(substrate, reg_cold, f"same-block-distinct-prep-{ctx.run_nonce}")
     distinct_prep_state = read_net_state(substrate, ctx.netuid, distinct_prep_rec.block_hash)
 
-    max_expected_distinct_charge = sat_mul_u64(
-        distinct_prep_state["burn"],
-        sat_pow_u64(max(1, increase_mult), max(0, batch_count - 1)),
+    pre_distinct_charges, _ = build_same_block_charge_sequence(
+        entry_burn=distinct_prep_state["burn"],
+        burn_increase_mult_raw=increase_mult_raw,
+        reg_count=batch_count,
+        min_burn=min_burn,
+        max_burn=max_burn,
     )
+    max_expected_distinct_charge = max(pre_distinct_charges) if pre_distinct_charges else distinct_prep_state["burn"]
     for cold, _ in diff_accounts:
         ensure_balance_for_next_registration(
             substrate=substrate,
@@ -2566,13 +3179,17 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
         start_block=distinct_sync_state["block"],
         end_block=distinct_state["block"],
         burn_half_life=half_life,
-        burn_increase_mult=increase_mult,
+        burn_increase_mult_raw=increase_mult_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         regs_this_block_map={},
     )
     expected_distinct_charges, expected_distinct_final_burn = build_same_block_charge_sequence(
         entry_burn=distinct_entry_burn,
-        burn_increase_mult=increase_mult,
+        burn_increase_mult_raw=increase_mult_raw,
         reg_count=batch_count,
+        min_burn=min_burn,
+        max_burn=max_burn,
     )
 
     log(format_state("batch-b", distinct_state["block"], distinct_state["burn"], distinct_state["regs"], ctx.decimals, distinct_state["n"], icon="👥"))
@@ -2647,7 +3264,9 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
         start_block=distinct_state["block"],
         end_block=distinct_post_state["block"],
         burn_half_life=half_life,
-        burn_increase_mult=increase_mult,
+        burn_increase_mult_raw=increase_mult_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         regs_this_block_map={},
     )
 
@@ -2675,66 +3294,145 @@ def run_same_block_multi_registration_scenario(ctx: NetworkContext):
     log(format_state("decay-b", distinct_post_state["block"], distinct_post_state["burn"], distinct_post_state["regs"], ctx.decimals, distinct_post_state["n"], icon="📉"))
     log("✅ Same-block multi-registration scenario passed.")
 
+# ─────────────────────────────────────────────────────────────
+# Verified burn-config application
+# ─────────────────────────────────────────────────────────────
+def apply_burn_config_and_sync(
+    substrate: SubstrateInterface,
+    owner_signers: Sequence[Tuple[str, Keypair]],
+    block_signer: Keypair,
+    netuid: int,
+    burn_half_life: int,
+    burn_increase_mult_num: Any,
+    sync_tag: str,
+    log: Optional[Callable[[str], None]] = None,
+    expected_min_burn: Optional[int] = None,
+    expected_max_burn: Optional[int] = None,
+) -> Tuple[Dict[str, int], int, int, int, int]:
+    expected_mult_raw = u64f64_from_num(burn_increase_mult_num)
+    last_snapshot: Optional[Tuple[Dict[str, int], int, int, int, int]] = None
+
+    def gap(tag: str):
+        produce_one_block(substrate, block_signer, f"{sync_tag}-{tag}")
+
+    for attempt in range(1, CONFIG_VERIFY_ATTEMPTS + 1):
+        gap(f"owner-gap-start-a{attempt}")
+        owner_set_burn_half_life(substrate, owner_signers, netuid, burn_half_life)
+
+        gap(f"owner-gap-mult-a{attempt}")
+        owner_set_burn_increase_mult(substrate, owner_signers, netuid, burn_increase_mult_num)
+
+        if expected_min_burn is not None:
+            gap(f"owner-gap-min-a{attempt}")
+            owner_set_min_burn(substrate, owner_signers, netuid, expected_min_burn)
+
+        if expected_max_burn is not None:
+            gap(f"owner-gap-max-a{attempt}")
+            owner_set_max_burn(substrate, owner_signers, netuid, expected_max_burn)
+
+        sync_rec = produce_one_block(substrate, block_signer, f"{sync_tag}-a{attempt}")
+        sync_hash = sync_rec.block_hash
+        sync_state_local = read_net_state(substrate, netuid, sync_hash)
+        min_burn_local = min_burn_at_strict(substrate, netuid, sync_hash)
+        max_burn_local = max_burn_at_strict(substrate, netuid, sync_hash)
+        hl_onchain_local = burn_half_life_at_strict(substrate, netuid, sync_hash)
+        mult_onchain_local = burn_increase_mult_raw_at_strict(substrate, netuid, sync_hash)
+
+        last_snapshot = (
+            sync_state_local,
+            min_burn_local,
+            max_burn_local,
+            hl_onchain_local,
+            mult_onchain_local,
+        )
+
+        matches = (
+            hl_onchain_local == int(burn_half_life)
+            and mult_onchain_local == expected_mult_raw
+            and (expected_min_burn is None or min_burn_local == int(expected_min_burn))
+            and (expected_max_burn is None or max_burn_local == int(expected_max_burn))
+        )
+        if matches:
+            return last_snapshot
+
+        if log is not None:
+            log(
+                "⚠️  Burn-config readback mismatch; retrying application "
+                f"(attempt {attempt}/{CONFIG_VERIFY_ATTEMPTS}) on subnet {netuid} | "
+                f"half_life={hl_onchain_local} expected={burn_half_life} | "
+                f"mult={fmt_u64f64(mult_onchain_local)} expected={fmt_u64f64(expected_mult_raw)} | "
+                f"min={min_burn_local} expected={expected_min_burn if expected_min_burn is not None else min_burn_local} | "
+                f"max={max_burn_local} expected={expected_max_burn if expected_max_burn is not None else max_burn_local}"
+            )
+        time.sleep(CONFIG_VERIFY_BACKOFF_SEC * attempt)
+
+    assert last_snapshot is not None
+    sync_state_local, min_burn_local, max_burn_local, hl_onchain_local, mult_onchain_local = last_snapshot
+    raise AssertionError(
+        "Burn-config verification failed after retries\n"
+        f"  subnet           = {netuid}\n"
+        f"  half_life        = {hl_onchain_local} (expected {burn_half_life})\n"
+        f"  mult             = {fmt_u64f64(mult_onchain_local)} (expected {fmt_u64f64(expected_mult_raw)})\n"
+        f"  min_burn         = {min_burn_local} (expected {expected_min_burn if expected_min_burn is not None else min_burn_local})\n"
+        f"  max_burn         = {max_burn_local} (expected {expected_max_burn if expected_max_burn is not None else max_burn_local})\n"
+        f"  block            = {sync_state_local['block']}\n"
+    )
+
 
 # ─────────────────────────────────────────────────────────────
 # Scenario: explicit burn config
 # ─────────────────────────────────────────────────────────────
-def run_one_config(ctx: NetworkContext, burn_half_life: int, burn_increase_mult: int, hotkey_tag: str):
+def run_one_config(ctx: NetworkContext, burn_half_life: int, burn_increase_mult_num: Any, hotkey_tag: str):
     substrate, sudo, reg_cold, log = open_network(ctx)
-    active_netuid = ctx.netuid
+    expected_mult_raw = u64f64_from_num(burn_increase_mult_num)
 
-    def configure_and_sync(netuid: int, sync_suffix: str) -> Tuple[Dict[str, int], int, int, int, int]:
-        sudo_set_burn_half_life(substrate, sudo, netuid, burn_half_life)
-        sudo_set_burn_increase_mult(substrate, sudo, netuid, burn_increase_mult)
+    active_netuid, owner_signers = allocate_scratch_subnet_for_stage(
+        substrate=substrate,
+        sudo=sudo,
+        decimals=ctx.decimals,
+        seed_tag=f"cfg-{hotkey_tag}-{ctx.netuid}-{ctx.run_nonce}",
+        log=log,
+    )
+    log_owner_signer_candidates(log, owner_signers)
 
-        sync_rec = produce_one_block(substrate, reg_cold, f"sync-{hotkey_tag}-{ctx.run_nonce}-{sync_suffix}")
-        sync_hash = sync_rec.block_hash
-        sync_state_local = read_net_state(substrate, netuid, sync_hash)
-        min_burn_local = min_burn_at(substrate, netuid, sync_hash)
-        max_burn_local = max_burn_at(substrate, netuid, sync_hash)
-        hl_onchain_local = burn_half_life_at_strict(substrate, netuid, sync_hash)
-        mult_onchain_local = burn_increase_mult_at_strict(substrate, netuid, sync_hash)
-        return sync_state_local, min_burn_local, max_burn_local, hl_onchain_local, mult_onchain_local
-
-    sync_state, min_burn, max_burn, hl_onchain, mult_onchain = configure_and_sync(active_netuid, "primary")
-
-    # After earlier scenarios, burn can decay into dust. That makes burned_register
-    # hit a reserve-floor corner unrelated to the burn update logic we want to test.
-    # In that case, run this explicit burn-config scenario on a fresh scratch subnet.
-    if min_burn > 0 and sync_state["burn"] < min_burn:
-        log(
-            f"⚠️  Current burn on subnet {active_netuid} is below MinBurn "
-            f"({fmt_tao(sync_state['burn'], ctx.decimals)} < {fmt_tao(min_burn, ctx.decimals)}); "
-            f"switching this burn-config stage to a fresh scratch subnet."
-        )
-        active_netuid = allocate_scratch_subnet_for_stage(
+    def configure_and_sync(
+        netuid: int,
+        signer_candidates: Sequence[Tuple[str, Keypair]],
+        sync_suffix: str,
+    ) -> Tuple[Dict[str, int], int, int, int, int]:
+        return apply_burn_config_and_sync(
             substrate=substrate,
-            sudo=sudo,
-            decimals=ctx.decimals,
-            seed_tag=f"cfg-{hotkey_tag}-{ctx.netuid}-{ctx.run_nonce}",
+            owner_signers=signer_candidates,
+            block_signer=reg_cold,
+            netuid=netuid,
+            burn_half_life=burn_half_life,
+            burn_increase_mult_num=burn_increase_mult_num,
+            sync_tag=f"sync-{hotkey_tag}-{ctx.run_nonce}-{sync_suffix}",
             log=log,
         )
-        sync_state, min_burn, max_burn, hl_onchain, mult_onchain = configure_and_sync(active_netuid, "scratch")
+
+    sync_state, min_burn, max_burn, hl_onchain, mult_onchain_raw = configure_and_sync(active_netuid, owner_signers, "scratch")
 
     factor_q32 = decay_factor_q32(burn_half_life)
     factor_float = factor_q32 / float(ONE_Q32)
 
     scenario_banner(
         log,
-        f"⚙️  Burn config | BurnHalfLife={burn_half_life} | BurnIncreaseMult={burn_increase_mult}",
+        f"⚙️  Burn config | BurnHalfLife={burn_half_life} | BurnIncreaseMult={fmt_u64f64(mult_onchain_raw)}",
         f"subnet = {active_netuid} | decay factor ≈ {factor_float:.12f} | "
-        f"min burn = {fmt_tao(min_burn, ctx.decimals) if min_burn else 'n/a'} | "
-        f"max burn = {fmt_tao(max_burn, ctx.decimals) if max_burn else 'n/a'}",
+        f"min burn = {fmt_tao(min_burn, ctx.decimals)} | max burn = {fmt_tao(max_burn, ctx.decimals)}",
     )
     log(format_state("sync", sync_state["block"], sync_state["burn"], sync_state["regs"], ctx.decimals, sync_state["n"], icon="🔎"))
 
     if sync_state["burn"] <= 0:
         raise AssertionError("Burn is 0 at sync block; cannot test dynamic pricing.")
 
-    if hl_onchain not in (0, burn_half_life):
+    if hl_onchain != burn_half_life:
         raise AssertionError(f"BurnHalfLife mismatch: expected {burn_half_life}, on-chain {hl_onchain}")
-    if mult_onchain not in (0, burn_increase_mult):
-        raise AssertionError(f"BurnIncreaseMult mismatch: expected {burn_increase_mult}, on-chain {mult_onchain}")
+    if mult_onchain_raw != expected_mult_raw:
+        raise AssertionError(
+            f"BurnIncreaseMult mismatch: expected {fmt_u64f64(expected_mult_raw)}, on-chain {fmt_u64f64(mult_onchain_raw)}"
+        )
 
     ensure_balance_for_next_registration(
         substrate=substrate,
@@ -2742,7 +3440,7 @@ def run_one_config(ctx: NetworkContext, burn_half_life: int, burn_increase_mult:
         who=reg_cold,
         reference_burn_planck=sync_state["burn"],
         decimals=ctx.decimals,
-        safety_mult=max(NEXT_REG_BALANCE_SAFETY_MULT, burn_increase_mult * 2),
+        safety_mult=safety_mult_from_u64f64(mult_onchain_raw),
         buffer_tao=NEXT_REG_BALANCE_BUFFER_TAO,
     )
 
@@ -2758,7 +3456,9 @@ def run_one_config(ctx: NetworkContext, burn_half_life: int, burn_increase_mult:
             start_block=sync_state["block"],
             end_block=reg_state["block"],
             burn_half_life=burn_half_life,
-            burn_increase_mult=burn_increase_mult,
+            burn_increase_mult_raw=mult_onchain_raw,
+            min_burn=min_burn,
+            max_burn=max_burn,
             regs_this_block_map={reg_state["block"]: reg_state["regs"]},
         )
 
@@ -2790,7 +3490,9 @@ def run_one_config(ctx: NetworkContext, burn_half_life: int, burn_increase_mult:
         start_block=reg_state["block"],
         end_block=after_state["block"],
         burn_half_life=burn_half_life,
-        burn_increase_mult=burn_increase_mult,
+        burn_increase_mult_raw=mult_onchain_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         regs_this_block_map={},
     )
 
@@ -2808,14 +3510,188 @@ def run_one_config(ctx: NetworkContext, burn_half_life: int, burn_increase_mult:
         decimals=ctx.decimals,
         start_state=after_state,
         burn_half_life=burn_half_life,
-        burn_increase_mult=burn_increase_mult,
+        burn_increase_mult_raw=mult_onchain_raw,
+        min_burn=min_burn,
+        max_burn=max_burn,
         num_steps=burn_half_life,
         tag_prefix=f"decay-{hotkey_tag}-{ctx.run_nonce}",
         print_prefix="dc",
         log=log,
     )
 
-    log(f"✅ Burn config passed for half_life={burn_half_life}, mult={burn_increase_mult}.")
+    log(f"✅ Burn config passed for half_life={burn_half_life}, mult={fmt_u64f64(expected_mult_raw)}.")
+
+def run_min_max_burn_clamp_scenario(ctx: NetworkContext):
+    substrate, sudo, reg_cold, log = open_network(ctx)
+
+    active_netuid, owner_signers = allocate_scratch_subnet_for_stage(
+        substrate=substrate,
+        sudo=sudo,
+        decimals=ctx.decimals,
+        seed_tag=f"clamp-{ctx.netuid}-{ctx.run_nonce}",
+        log=log,
+    )
+    log_owner_signer_candidates(log, owner_signers)
+
+    base_sync_rec = produce_one_block(substrate, reg_cold, f"clamp-base-sync-{ctx.run_nonce}")
+    base_state = read_net_state(substrate, active_netuid, base_sync_rec.block_hash)
+
+    if base_state["burn"] <= 0:
+        raise AssertionError("Clamp scenario requires a positive starting burn.")
+
+    min_burn = base_state["burn"]
+    max_burn = min(U64_MAX, min_burn + max(1, min_burn // 4))
+    if max_burn <= min_burn:
+        max_burn = min_burn + 1
+
+    sync_state, onchain_min, onchain_max, half_life, mult_raw = apply_burn_config_and_sync(
+        substrate=substrate,
+        owner_signers=owner_signers,
+        block_signer=reg_cold,
+        netuid=active_netuid,
+        burn_half_life=CLAMP_TEST_HALF_LIFE,
+        burn_increase_mult_num=CLAMP_TEST_MULT,
+        sync_tag=f"clamp-sync-{ctx.run_nonce}",
+        log=log,
+        expected_min_burn=min_burn,
+        expected_max_burn=max_burn,
+    )
+    sync_hash = sync_state["hash"]
+    factor_q32 = decay_factor_q32(half_life)
+    factor_float = factor_q32 / float(ONE_Q32)
+
+    scenario_banner(
+        log,
+        f"🧱 Clamp scenario | BurnHalfLife={half_life} | BurnIncreaseMult={fmt_u64f64(mult_raw)}",
+        f"subnet = {active_netuid} | decay factor ≈ {factor_float:.12f} | "
+        f"min burn = {fmt_tao(onchain_min, ctx.decimals)} | max burn = {fmt_tao(onchain_max, ctx.decimals)}",
+    )
+    log(format_state("sync", sync_state["block"], sync_state["burn"], sync_state["regs"], ctx.decimals, sync_state["n"], icon="🔎"))
+
+    expected_mult_raw = u64f64_from_num(CLAMP_TEST_MULT)
+    if half_life != CLAMP_TEST_HALF_LIFE:
+        raise AssertionError(f"Clamp scenario BurnHalfLife mismatch: expected {CLAMP_TEST_HALF_LIFE}, got {half_life}")
+    if mult_raw != expected_mult_raw:
+        raise AssertionError(
+            f"Clamp scenario BurnIncreaseMult mismatch: expected {fmt_u64f64(expected_mult_raw)}, got {fmt_u64f64(mult_raw)}"
+        )
+    if onchain_min != min_burn:
+        raise AssertionError(f"Clamp scenario MinBurn mismatch: expected {min_burn}, got {onchain_min}")
+    if onchain_max != max_burn:
+        raise AssertionError(f"Clamp scenario MaxBurn mismatch: expected {max_burn}, got {onchain_max}")
+
+    ensure_balance_for_next_registration(
+        substrate=substrate,
+        funder=sudo,
+        who=reg_cold,
+        reference_burn_planck=max(sync_state["burn"], onchain_max),
+        decimals=ctx.decimals,
+        safety_mult=safety_mult_from_u64f64(mult_raw),
+        buffer_tao=NEXT_REG_BALANCE_BUFFER_TAO,
+    )
+
+    hot = Keypair.create_from_uri(f"//Alice//DynBurnClampHot//Net{active_netuid}//Run{ctx.run_nonce}")
+    reg_rec = burned_register_with_retry(substrate, reg_cold, hot.ss58_address, active_netuid)
+    reg_state = read_net_state(substrate, active_netuid, reg_rec.block_hash)
+
+    entry_burn_before_registration = simulate_from_block_state(
+        start_burn=sync_state["burn"],
+        start_block=sync_state["block"],
+        end_block=reg_state["block"],
+        burn_half_life=half_life,
+        burn_increase_mult_raw=mult_raw,
+        min_burn=onchain_min,
+        max_burn=onchain_max,
+        regs_this_block_map={},
+    )
+    unclamped_post_bump = mul_u64_by_u64f64(entry_burn_before_registration, normalized_mult_raw(mult_raw))
+    if unclamped_post_bump <= onchain_max:
+        raise AssertionError(
+            "Clamp scenario did not actually exercise the max-burn clamp; "
+            f"unclamped burn {unclamped_post_bump} <= max burn {onchain_max}"
+        )
+
+    if not receipt_was_recovered(reg_rec):
+        exp_burn_reg = simulate_from_block_state(
+            start_burn=sync_state["burn"],
+            start_block=sync_state["block"],
+            end_block=reg_state["block"],
+            burn_half_life=half_life,
+            burn_increase_mult_raw=mult_raw,
+            min_burn=onchain_min,
+            max_burn=onchain_max,
+            regs_this_block_map={reg_state["block"]: reg_state["regs"]},
+        )
+        assert_state(
+            phase="clamp scenario registration block should match runtime logic",
+            actual_burn=reg_state["burn"],
+            expected_burn=exp_burn_reg,
+            decimals=ctx.decimals,
+        )
+
+    if reg_state["burn"] != onchain_max:
+        raise AssertionError(
+            "[assert] clamp scenario registration should hit the configured MaxBurn\n"
+            f"  actual burn = {reg_state['burn']} ({fmt_tao(reg_state['burn'], ctx.decimals)})\n"
+            f"  max burn    = {onchain_max} ({fmt_tao(onchain_max, ctx.decimals)})\n"
+        )
+
+    after_one_rec = produce_one_block(substrate, reg_cold, f"clamp-after-one-{ctx.run_nonce}")
+    after_one_state = read_net_state(substrate, active_netuid, after_one_rec.block_hash)
+    exp_after_one = simulate_from_block_state(
+        start_burn=reg_state["burn"],
+        start_block=reg_state["block"],
+        end_block=after_one_state["block"],
+        burn_half_life=half_life,
+        burn_increase_mult_raw=mult_raw,
+        min_burn=onchain_min,
+        max_burn=onchain_max,
+        regs_this_block_map={},
+    )
+    assert_state(
+        phase="clamp scenario first decay block should match runtime logic",
+        actual_burn=after_one_state["burn"],
+        expected_burn=exp_after_one,
+        decimals=ctx.decimals,
+    )
+
+    if after_one_state["burn"] != onchain_min:
+        raise AssertionError(
+            "[assert] clamp scenario first decay block should fall to the configured MinBurn\n"
+            f"  actual burn = {after_one_state['burn']} ({fmt_tao(after_one_state['burn'], ctx.decimals)})\n"
+            f"  min burn    = {onchain_min} ({fmt_tao(onchain_min, ctx.decimals)})\n"
+        )
+
+    after_two_rec = produce_one_block(substrate, reg_cold, f"clamp-after-two-{ctx.run_nonce}")
+    after_two_state = read_net_state(substrate, active_netuid, after_two_rec.block_hash)
+    exp_after_two = simulate_from_block_state(
+        start_burn=after_one_state["burn"],
+        start_block=after_one_state["block"],
+        end_block=after_two_state["block"],
+        burn_half_life=half_life,
+        burn_increase_mult_raw=mult_raw,
+        min_burn=onchain_min,
+        max_burn=onchain_max,
+        regs_this_block_map={},
+    )
+    assert_state(
+        phase="clamp scenario second decay block should remain clamped at MinBurn",
+        actual_burn=after_two_state["burn"],
+        expected_burn=exp_after_two,
+        decimals=ctx.decimals,
+    )
+
+    if after_two_state["burn"] != onchain_min:
+        raise AssertionError(
+            "[assert] clamp scenario second decay block should remain at MinBurn\n"
+            f"  actual burn = {after_two_state['burn']} ({fmt_tao(after_two_state['burn'], ctx.decimals)})\n"
+            f"  min burn    = {onchain_min} ({fmt_tao(onchain_min, ctx.decimals)})\n"
+        )
+
+    log(format_state("register", reg_state["block"], reg_state["burn"], reg_state["regs"], ctx.decimals, reg_state["n"], icon="📝"))
+    log(format_state("decay-1", after_one_state["block"], after_one_state["burn"], after_one_state["regs"], ctx.decimals, after_one_state["n"], icon="📉"))
+    log(format_state("decay-2", after_two_state["block"], after_two_state["burn"], after_two_state["regs"], ctx.decimals, after_two_state["n"], icon="📉"))
+    log("✅ Min/max burn clamp scenario passed.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2836,16 +3712,29 @@ def bootstrap_network(ctx: NetworkContext):
     log(f"🔌 Connected to {ctx.ws} | decimals={ctx.decimals} | payer={short_ss58(reg_cold.ss58_address)}")
 
 
-def ensure_requested_netuids_exist(ws: str, requested_netuids: List[int], decimals: int):
+def ensure_requested_netuids_exist(
+    ws: str,
+    requested_netuids: List[int],
+    decimals: int,
+    owner_cold_uri_overrides: Optional[Dict[int, str]] = None,
+    owner_hot_uri_overrides: Optional[Dict[int, str]] = None,
+):
     requested = sorted(set(n for n in requested_netuids if n != 0))
     if not requested:
         return
+
+    owner_cold_uri_overrides = owner_cold_uri_overrides or {}
+    owner_hot_uri_overrides = owner_hot_uri_overrides or {}
 
     substrate = connect(ws)
     sudo = Keypair.create_from_uri("//Alice")
 
     try:
         sudo_set_network_rate_limit(substrate, sudo, 0)
+    except Exception:
+        pass
+    try:
+        sudo_set_owner_hparam_rate_limit(substrate, sudo, 0)
     except Exception:
         pass
 
@@ -2880,8 +3769,10 @@ def ensure_requested_netuids_exist(ws: str, requested_netuids: List[int], decima
             )
 
         target = missing[0]
-        owner_cold = Keypair.create_from_uri(f"//Alice//SubnetOwnerCold//Net{target}")
-        owner_hot = Keypair.create_from_uri(f"//Alice//SubnetOwnerHot//Net{target}")
+        owner_cold_uri = owner_cold_uri_overrides.get(target, f"//Alice//SubnetOwnerCold//Net{target}")
+        owner_hot_uri = owner_hot_uri_overrides.get(target, f"//Alice//SubnetOwnerHot//Net{target}")
+        owner_cold = Keypair.create_from_uri(owner_cold_uri)
+        owner_hot = Keypair.create_from_uri(owner_hot_uri)
 
         ensure_min_balance(substrate, sudo, owner_cold, REGISTER_NETWORK_MIN_OWNER_COLD_TAO, decimals)
         ensure_min_balance(substrate, sudo, owner_hot, REGISTER_NETWORK_MIN_OWNER_HOT_TAO, decimals)
@@ -2900,6 +3791,13 @@ def ensure_requested_netuids_exist(ws: str, requested_netuids: List[int], decima
         if not created:
             raise RuntimeError(
                 f"register_network did not create a visible subnet while targeting missing={missing}"
+            )
+
+        for created_netuid in created:
+            remember_subnet_owner_uris(
+                created_netuid,
+                cold_uri=owner_cold_uri,
+                hot_uri=owner_hot_uri,
             )
 
         safe_print(
@@ -2996,6 +3894,28 @@ def parse_netuids_arg(value: Optional[str]) -> List[int]:
     return out
 
 
+def parse_owner_uri_map_arg(value: Optional[str]) -> Dict[int, str]:
+    if not value:
+        return {}
+
+    out: Dict[int, str] = {}
+    for part in value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise RuntimeError(
+                "Owner URI mappings must use the form netuid=URI,netuid=URI"
+            )
+        netuid_s, uri = item.split("=", 1)
+        netuid = int(netuid_s.strip())
+        uri = uri.strip()
+        if not uri:
+            raise RuntimeError(f"Missing URI for owner mapping on netuid {netuid}")
+        out[netuid] = uri
+    return out
+
+
 def resolve_existing_netuids(substrate: SubstrateInterface, limit_networks: Optional[int]) -> List[int]:
     nets = [n for n in networks_added(substrate) if n != 0]
     nets = sorted(set(nets))
@@ -3017,6 +3937,16 @@ def main():
     parser.add_argument("--limit-networks", type=int, default=None, help="Cap the number of auto-discovered non-root networks")
     parser.add_argument("--workers", type=int, default=None, help="Number of concurrent worker threads")
     parser.add_argument("--with-default-stress", action="store_true", help="Run the heavy default-parameter stress scenario before the other tests")
+    parser.add_argument(
+        "--owner-uris",
+        default=None,
+        help="Optional netuid-to-secret mapping for subnet owner coldkeys, e.g. 1=//Alice,2=//Alice//SubnetOwnerCold//Net2",
+    )
+    parser.add_argument(
+        "--owner-hot-uris",
+        default=None,
+        help="Optional netuid-to-secret mapping for subnet owner hotkeys, e.g. 1=//Alice//SubnetOwnerHot//Net1",
+    )
     args = parser.parse_args()
 
     base = connect(args.ws)
@@ -3025,6 +3955,10 @@ def main():
 
     try:
         sudo_set_network_rate_limit(base, sudo, 0)
+    except Exception:
+        pass
+    try:
+        sudo_set_owner_hparam_rate_limit(base, sudo, 0)
     except Exception:
         pass
 
@@ -3040,8 +3974,17 @@ def main():
     else:
         requested_netuids = []
 
+    owner_uri_overrides = parse_owner_uri_map_arg(args.owner_uris)
+    owner_hot_uri_overrides = parse_owner_uri_map_arg(args.owner_hot_uris)
+
     if explicit_request:
-        ensure_requested_netuids_exist(args.ws, requested_netuids, decimals)
+        ensure_requested_netuids_exist(
+            args.ws,
+            requested_netuids,
+            decimals,
+            owner_cold_uri_overrides=owner_uri_overrides,
+            owner_hot_uri_overrides=owner_hot_uri_overrides,
+        )
         netuids = sorted(set(n for n in requested_netuids if n != 0))
     else:
         netuids = resolve_existing_netuids(base, args.limit_networks)
@@ -3071,9 +4014,14 @@ def main():
             decimals=decimals,
             run_nonce=int(time.time() * 1000) + (netuid * 1_000_000),
             payer_uri=f"//Alice//DynBurnCold//Net{netuid}",
+            owner_cold_uri=owner_uri_overrides.get(netuid, f"//Alice//SubnetOwnerCold//Net{netuid}"),
+            owner_hot_uri=owner_hot_uri_overrides.get(netuid, f"//Alice//SubnetOwnerHot//Net{netuid}"),
         )
         for netuid in netuids
     ]
+
+    for ctx in contexts:
+        remember_subnet_owner_uris(ctx.netuid, ctx.owner_cold_uri, ctx.owner_hot_uri)
 
     safe_print(f"🌐 Connected to {args.ws} | decimals={decimals}")
     safe_print(
@@ -3128,6 +4076,14 @@ def main():
             stage_fn=lambda ctx, _hl=hl, _mult=mult, _tag=hotkey_tag: run_one_config(ctx, _hl, _mult, _tag),
             retryable_stage=False,
         )
+
+    run_stage_across_networks(
+        stage_title="min/max burn clamp scenario",
+        contexts=contexts,
+        workers=workers,
+        stage_fn=run_min_max_burn_clamp_scenario,
+        retryable_stage=False,
+    )
 
     safe_print("\n🎉 All dynamic burn pricing assertions passed across all requested networks.\n")
 
